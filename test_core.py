@@ -14,6 +14,23 @@ from core.queue_manager import QueueManager
 from core.exporter import HistoryExporter
 
 
+"""
+核心链路集成测试
+覆盖场景:
+  1. CSV 导入与字段校验（文件名缺失/份数非法/柜台未知）
+  2. 柜台优先级排序
+  3. 单任务暂停/继续 + 操作者记录
+  4. 取消/撤销取消 + 已取消任务继续被拒绝
+  5. 调度器自动完成打印
+  6. 模拟失败 + 自动重试 + 超阈值转人工处理
+  7. 任务级持久化与重启一致性（状态/重试/暂停/原因/操作者）
+  8. 历史导出（CSV/JSON）+ 导出日志
+  9. 【全局暂停回归】持久化/重启恢复/暂停期不调度/手动继续后恢复
+     注意：本条专门验证"全局暂停"这一非任务级状态的重启一致性，
+     与第 3、7 条的单任务暂停/任务级持久化是不同维度。
+"""
+
+
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
@@ -177,6 +194,71 @@ def test_full_chain():
         exp_logs = storage.load_export_logs()
         assert len(exp_logs) >= 2, "导出记录应写入"
         log(f"  - 导出日志 OK: 共{len(exp_logs)}条记录")
+
+        log("=== 9. 全局暂停持久化与重启回归 ===")
+        # 准备 3 条任务，关闭失败模拟
+        queue.stop_worker()
+        cfg = queue.config
+        cfg.simulate_failure_enabled = False
+        cfg.global_paused = False
+        cfg.print_duration_ms = 100
+        queue.update_config(cfg)
+        # 清掉历史，只留活跃任务
+        for tid in [t.id for t in queue.tasks]:
+            queue.remove_task(tid, operator="测试清理")
+        for i in range(3):
+            t = PrintTask.create(filename=f"排队文件_{i}.pdf", copies=1,
+                                 counter=CounterType.A, max_retries=3)
+            queue.add_tasks([t])
+        assert queue.get_statistics()["等待中"] == 3
+        log(f"  - 准备 3 条等待任务 OK")
+
+        # 设为全局暂停
+        queue.set_global_paused(True, operator="测试员暂停")
+        assert queue.global_paused is True
+        paused_cfg_val = queue.config.global_paused
+        assert paused_cfg_val is True, "config 中的 global_paused 应同步为 True"
+        log("  - 设置全局暂停: 内存与 config 同步 OK")
+
+        # 持久化后重新读取配置验证
+        saved_cfg = storage.load_config()
+        assert saved_cfg.global_paused is True, "配置文件中应持久化 global_paused=true"
+        log("  - 持久化到磁盘: config.json 中 global_paused=true OK")
+
+        # 模拟"重启"：新建 QueueManager，看初始状态
+        queue2 = QueueManager(storage, saved_cfg, on_log=lambda m: None)
+        assert queue2.global_paused is True, "新建 QueueManager 后应恢复全局暂停=true"
+        log("  - 重启恢复: 新 QueueManager 初始 global_paused=true OK")
+
+        # 启动调度器，等待一段时间后任务不应推进（仍然 3 条等待）
+        queue2.start_worker()
+        time.sleep(1.5)
+        stats2 = queue2.get_statistics()
+        assert stats2["已完成"] == 0 and stats2["等待中"] == 3, \
+            f"全局暂停下任务不应被调度: 完成{stats2['已完成']}, 等待{stats2['等待中']}"
+        log(f"  - 暂停期间不调度: 1.5s 后仍 0 完成 / 3 等待 OK")
+
+        # 用户明确点击"继续"后，队列才恢复
+        queue2.set_global_paused(False, operator="测试员继续")
+        assert queue2.global_paused is False
+        deadline = time.time() + 10
+        done = False
+        while time.time() < deadline:
+            if queue2.get_statistics()["已完成"] >= 3:
+                done = True
+                break
+            time.sleep(0.2)
+        assert done, "解除全局暂停后任务应全部完成"
+        log("  - 解除暂停后恢复调度: 3 条任务全部完成 OK")
+        queue2.stop_worker()
+
+        # 反向验证：重启后若 config 为 false，也应恢复为 false（默认值一致性）
+        cfg3 = storage.load_config()
+        cfg3.global_paused = False
+        storage.save_config(cfg3)
+        queue3 = QueueManager(storage, cfg3, on_log=lambda m: None)
+        assert queue3.global_paused is False, "默认/非暂停状态重启后也应保持一致"
+        log("  - 非暂停状态重启一致性: false 恢复为 false OK")
 
         log("")
         log("=" * 60)

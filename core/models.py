@@ -102,6 +102,7 @@ class AppConfig:
     simulate_failure_enabled: bool = False
     print_duration_ms: int = 2000
     operator_name: str = "系统管理员"
+    global_paused: bool = False
     last_export_record: Optional[dict] = None
 
     def to_dict(self) -> dict:
@@ -121,5 +122,6 @@ class AppConfig:
             simulate_failure_enabled=d.get("simulate_failure_enabled", False),
             print_duration_ms=d.get("print_duration_ms", 2000),
             operator_name=d.get("operator_name", "系统管理员"),
+            global_paused=d.get("global_paused", False),
             last_export_record=d.get("last_export_record"),
         )

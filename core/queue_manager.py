@@ -21,7 +21,7 @@ class QueueManager:
         self._printer = SimulatedPrinter(get_config=lambda: self._config)
         self._worker_thread: Optional[threading.Thread] = None
         self._worker_stop_event = threading.Event()
-        self._global_paused = False
+        self._global_paused = config.global_paused
         self._dirty = False
 
         self._tasks = [t for t in self._tasks if t is not None]
@@ -46,6 +46,7 @@ class QueueManager:
     def update_config(self, new_config: AppConfig):
         with self._lock:
             self._config = new_config
+            self._global_paused = new_config.global_paused
             self._storage.save_config(new_config)
             self._notify()
 
@@ -64,6 +65,8 @@ class QueueManager:
     def set_global_paused(self, paused: bool, operator: Optional[str] = None):
         with self._lock:
             self._global_paused = paused
+            self._config.global_paused = paused
+            self._storage.save_config(self._config)
             if operator:
                 self._log(f"{'全局暂停' if paused else '全局继续'}：操作者 {operator}")
             self._notify()

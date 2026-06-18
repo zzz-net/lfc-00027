@@ -318,6 +318,7 @@ class PrintQueueApp:
 
     def _refresh_all(self):
         self._refresh_all_data()
+        self._update_worker_status_hint()
         self._set_status(f"系统就绪 | 数据目录: {DATA_DIR}")
 
     def _refresh_all_data(self):
