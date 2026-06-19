@@ -11,6 +11,7 @@ from core.export_record import (
     ConflictHint, CONFLICT_HINT_LABELS, EXPORT_TRIGGER_LABELS,
     compute_file_hash,
 )
+from core.review_workbench import ReviewWorkbenchManager, DetailTabState
 
 
 class ExportRecordDialog(tk.Toplevel):
@@ -26,6 +27,7 @@ class ExportRecordDialog(tk.Toplevel):
         self._operator = operator
         self._records: List[ExportRecord] = []
         self._selected_record: Optional[ExportRecord] = None
+        self._review_manager = ReviewWorkbenchManager()
 
         self._build_ui()
         self._load_initial_state()
@@ -169,6 +171,8 @@ class ExportRecordDialog(tk.Toplevel):
 
         ttk.Button(bar, text="关闭", command=self._on_close).pack(side=tk.RIGHT, padx=4)
         ttk.Button(bar, text="🗑 删除选中记录", command=self._action_delete_record).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(bar, text="📷 保存快照", command=self._action_save_snapshot).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(bar, text="🔍 回看工作台", command=self._action_open_workbench).pack(side=tk.RIGHT, padx=4)
 
     def _load_initial_state(self):
         ui_state = self._manager.load_ui_state()
@@ -435,6 +439,56 @@ class ExportRecordDialog(tk.Toplevel):
             last_viewed_record_id=self._selected_record.record_id if self._selected_record else None,
         )
         self._manager.save_ui_state(state)
+
+    def _action_save_snapshot(self):
+        if self._selected_record is None:
+            messagebox.showinfo("提示", "请先选择一条导出记录", parent=self)
+            return
+
+        detail_state = DetailTabState(
+            tab_index=0,
+            scroll_position=0.0,
+            expanded_sections=[],
+        )
+
+        try:
+            scroll_pos = self._detail_text.yview()[0]
+            detail_state.scroll_position = scroll_pos
+        except (tk.TclError, IndexError):
+            pass
+
+        filter_snapshot = {
+            "status_filter": self._get_status_filter().value if self._get_status_filter() else None,
+            "trigger_filter": self._get_trigger_filter().value if self._get_trigger_filter() else None,
+            "search_text": self._search_var.get().strip(),
+        }
+
+        batch_context = None
+        if self._selected_record.batch_summary:
+            batch_context = dict(self._selected_record.batch_summary)
+
+        snapshot = self._review_manager.create_snapshot(
+            record_id=self._selected_record.record_id,
+            detail_state=detail_state,
+            filter_snapshot=filter_snapshot,
+            batch_context=batch_context,
+        )
+
+        messagebox.showinfo(
+            "快照已保存",
+            f"已保存查看快照:\n{snapshot.title}\n\n可在'回看工作台'中查看和管理。",
+            parent=self,
+        )
+
+    def _action_open_workbench(self):
+        from ui.review_workbench_dialog import ReviewWorkbenchDialog
+        dlg = ReviewWorkbenchDialog(
+            self, self._review_manager,
+            record_manager=self._manager,
+            operator=self._operator,
+        )
+        self.wait_window(dlg)
+        self._refresh_list()
 
     def _on_close(self):
         self._save_ui_state()
