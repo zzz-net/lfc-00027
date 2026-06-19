@@ -16,6 +16,10 @@ from .preflight import (
     PreflightCategory, ConflictType, ConflictResolution,
     ConflictInfo, PreflightItem, ACTIVE_TASK_STATUSES,
 )
+from .export_record import (
+    ExportRecordManager, ExportStatus, ExportTrigger, ExportFileEntry,
+    compute_file_hash, compute_content_hash,
+)
 
 
 BATCHES_FILE = DATA_DIR / "playback_batches.json"
@@ -273,6 +277,7 @@ class BatchPlaybackManager:
     def __init__(self, storage: Optional[Storage] = None):
         self._storage = storage or Storage()
         self._lock = threading.RLock()
+        self._export_record_manager = ExportRecordManager(self._storage)
 
     def create_batch(self, file_path: str,
                      existing_tasks: Optional[List[PrintTask]] = None,
@@ -838,8 +843,69 @@ class BatchPlaybackManager:
             "batch": batch.to_dict(),
         }
 
-        with open(full_path, "w", encoding="utf-8") as f:
-            json.dump(export_data, f, ensure_ascii=False, indent=2)
+        try:
+            with open(full_path, "w", encoding="utf-8") as f:
+                json.dump(export_data, f, ensure_ascii=False, indent=2)
+
+            content_hash = compute_content_hash(export_data)
+            file_hash = compute_file_hash(str(full_path))
+            file_size = os.path.getsize(full_path) if full_path.exists() else 0
+            counts = batch.group_counts()
+            file_entry = ExportFileEntry(
+                filename=filename,
+                file_path=str(full_path),
+                file_size=file_size,
+                row_count=len(batch.items),
+                content_hash=file_hash,
+            )
+
+            self._export_record_manager.create_record(
+                trigger=ExportTrigger.AUDIT_PACKAGE,
+                status=ExportStatus.SUCCESS,
+                operator=operator or batch.operator or "系统",
+                filter_snapshot={"batch_id": batch.batch_id, "source_file": batch.source_file},
+                batch_summary={
+                    "batch_id": batch.batch_id,
+                    "source_file": Path(batch.source_file).name,
+                    "source_format": batch.source_format,
+                    "status": batch.status.value,
+                    "total_items": len(batch.items),
+                    "group_counts": counts,
+                },
+                files=[file_entry],
+                statistics={
+                    "total_items": len(batch.items),
+                    "success_count": counts.get("success", 0),
+                    "auto_fixable_count": counts.get("auto_fixable", 0),
+                    "conflict_count": counts.get("duplicate_conflict", 0),
+                    "unimportable_count": counts.get("unimportable", 0),
+                },
+                content_hash=content_hash,
+                version_tag=f"v1_{batch.batch_id[:12]}",
+                result_message=f"审计包导出成功: {len(batch.items)} 条记录",
+            )
+        except PermissionError as e:
+            self._export_record_manager.create_record(
+                trigger=ExportTrigger.AUDIT_PACKAGE,
+                status=ExportStatus.FAILED,
+                operator=operator or batch.operator or "系统",
+                filter_snapshot={"batch_id": batch.batch_id},
+                batch_summary={"batch_id": batch.batch_id},
+                failure_reason=f"权限不足: {e}",
+                result_message="审计包导出失败: 权限不足",
+            )
+            raise
+        except OSError as e:
+            self._export_record_manager.create_record(
+                trigger=ExportTrigger.AUDIT_PACKAGE,
+                status=ExportStatus.FAILED,
+                operator=operator or batch.operator or "系统",
+                filter_snapshot={"batch_id": batch.batch_id},
+                batch_summary={"batch_id": batch.batch_id},
+                failure_reason=f"IO错误: {e}",
+                result_message="审计包导出失败: IO错误",
+            )
+            raise
 
         return str(full_path)
 

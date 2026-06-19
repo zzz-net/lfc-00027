@@ -104,6 +104,7 @@ class AppConfig:
     operator_name: str = "系统管理员"
     global_paused: bool = False
     last_export_record: Optional[dict] = None
+    export_record_ui_state: Optional[dict] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -124,4 +125,5 @@ class AppConfig:
             operator_name=d.get("operator_name", "系统管理员"),
             global_paused=d.get("global_paused", False),
             last_export_record=d.get("last_export_record"),
+            export_record_ui_state=d.get("export_record_ui_state"),
         )

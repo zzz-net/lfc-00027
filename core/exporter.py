@@ -8,6 +8,10 @@ from dataclasses import dataclass
 
 from .models import PrintTask, TaskStatus
 from .storage import Storage
+from .export_record import (
+    ExportRecordManager, ExportStatus, ExportTrigger, ExportFileEntry,
+    compute_file_hash,
+)
 
 
 @dataclass
@@ -23,6 +27,7 @@ class HistoryExporter:
 
     def __init__(self, storage: Storage):
         self._storage = storage
+        self._export_record_manager = ExportRecordManager(storage)
 
     @classmethod
     def _fmt_time(cls, ts: Optional[float]) -> str:
@@ -72,6 +77,7 @@ class HistoryExporter:
 
     def _export(self, tasks: List[PrintTask], output_dir: str, operator: str,
                 fmt: str, tag: str, all_tasks: bool = False) -> ExportResult:
+        trigger = ExportTrigger.MANUAL_ALL if all_tasks else ExportTrigger.MANUAL_HISTORY
         try:
             out_path = Path(output_dir)
             out_path.mkdir(parents=True, exist_ok=True)
@@ -98,6 +104,28 @@ class HistoryExporter:
                     json.dump(rows, f, ensure_ascii=False, indent=2)
 
             count = len(tasks)
+            file_hash = compute_file_hash(str(full_path))
+            file_size = os.path.getsize(full_path) if full_path.exists() else 0
+            file_entry = ExportFileEntry(
+                filename=filename,
+                file_path=str(full_path),
+                file_size=file_size,
+                row_count=count,
+                content_hash=file_hash,
+            )
+
+            self._export_record_manager.create_record(
+                trigger=trigger,
+                status=ExportStatus.SUCCESS,
+                operator=operator,
+                filter_snapshot={"tag": tag, "format": ext, "all_tasks": all_tasks},
+                files=[file_entry],
+                statistics={"row_count": count, "format": ext},
+                content_hash=file_hash,
+                version_tag=f"v1_{timestamp}",
+                result_message=f"成功导出{count}条{tag}",
+            )
+
             record = {
                 "file": str(full_path),
                 "filename": filename,
@@ -112,11 +140,35 @@ class HistoryExporter:
             return ExportResult(success=True, file_path=str(full_path), count=count, message=msg)
 
         except PermissionError as e:
+            self._export_record_manager.create_record(
+                trigger=trigger,
+                status=ExportStatus.FAILED,
+                operator=operator,
+                filter_snapshot={"tag": tag, "format": fmt},
+                failure_reason=f"权限不足: {e}",
+                result_message=f"导出失败：权限不足",
+            )
             return ExportResult(success=False, file_path="", count=0,
                                 message=f"导出失败：权限不足 {e}")
         except OSError as e:
+            self._export_record_manager.create_record(
+                trigger=trigger,
+                status=ExportStatus.FAILED,
+                operator=operator,
+                filter_snapshot={"tag": tag, "format": fmt},
+                failure_reason=f"IO错误: {e}",
+                result_message=f"导出失败：IO错误",
+            )
             return ExportResult(success=False, file_path="", count=0,
                                 message=f"导出失败：IO错误 {e}")
         except Exception as e:
+            self._export_record_manager.create_record(
+                trigger=trigger,
+                status=ExportStatus.FAILED,
+                operator=operator,
+                filter_snapshot={"tag": tag, "format": fmt},
+                failure_reason=f"{type(e).__name__}: {e}",
+                result_message=f"导出失败：{type(e).__name__}",
+            )
             return ExportResult(success=False, file_path="", count=0,
                                 message=f"导出失败：{type(e).__name__}: {e}")

@@ -1,0 +1,228 @@
+[
+  {
+    "record_id": "exp_1781845001320_2e19414d",
+    "exported_at": 1781845001.320012,
+    "trigger": "audit_package",
+    "status": "success",
+    "operator": "导出员",
+    "filter_snapshot": {
+      "batch_id": "batch_1781845001296_12b1",
+      "source_file": "C:\\Users\\admin\\AppData\\Local\\Temp\\1\\playback_test_strbw0gr\\keep_test.csv"
+    },
+    "batch_summary": {
+      "batch_id": "batch_1781845001296_12b1",
+      "source_file": "keep_test.csv",
+      "source_format": "csv",
+      "status": "pending",
+      "total_items": 1,
+      "group_counts": {
+        "success": 0,
+        "auto_fixable": 0,
+        "duplicate_conflict": 1,
+        "unimportable": 0
+      }
+    },
+    "files": [
+      {
+        "filename": "audit_batch_batch_1781845001296_12b1_20260619_125641.json",
+        "file_path": "C:\\Users\\admin\\AppData\\Local\\Temp\\1\\playback_test_strbw0gr\\exports\\audit_batch_batch_1781845001296_12b1_20260619_125641.json",
+        "file_size": 3393,
+        "row_count": 1,
+        "content_hash": "3b24d5c1432fb1e15d502da952a7287e0d9aef8374a35e5f2615c8a51f3aa3e8"
+      }
+    ],
+    "statistics": {
+      "total_items": 1,
+      "success_count": 0,
+      "auto_fixable_count": 0,
+      "conflict_count": 1,
+      "unimportable_count": 0
+    },
+    "content_hash": "881da519d838f365c809f23e2cc8ad39aa802f4ba650092d512a3364af3d7b4a",
+    "version_tag": "v1_batch_178184",
+    "result_message": "审计包导出成功: 1 条记录",
+    "failure_reason": "",
+    "conflict_hint": "none",
+    "conflict_detail": "",
+    "log_entries": []
+  },
+  {
+    "record_id": "exp_1781845016182_f8ee8557",
+    "exported_at": 1781845016.182681,
+    "trigger": "manual_history",
+    "status": "success",
+    "operator": "测试员",
+    "filter_snapshot": {
+      "tag": "历史记录",
+      "format": "csv",
+      "all_tasks": false
+    },
+    "batch_summary": null,
+    "files": [
+      {
+        "filename": "print_历史记录_20260619_125656.csv",
+        "file_path": "C:\\Users\\admin\\AppData\\Local\\Temp\\1\\printq_test_tm4l_335\\export\\print_历史记录_20260619_125656.csv",
+        "file_size": 348,
+        "row_count": 1,
+        "content_hash": "1162eb757ceae0a3e959875771d2c329a8b72fd8537f711c488e9da75e312478"
+      }
+    ],
+    "statistics": {
+      "row_count": 1,
+      "format": "csv"
+    },
+    "content_hash": "1162eb757ceae0a3e959875771d2c329a8b72fd8537f711c488e9da75e312478",
+    "version_tag": "v1_20260619_125656",
+    "result_message": "成功导出1条历史记录",
+    "failure_reason": "",
+    "conflict_hint": "none",
+    "conflict_detail": "",
+    "log_entries": []
+  },
+  {
+    "record_id": "exp_1781845016196_76111aeb",
+    "exported_at": 1781845016.1967478,
+    "trigger": "manual_all",
+    "status": "success",
+    "operator": "测试员",
+    "filter_snapshot": {
+      "tag": "全部任务",
+      "format": "json",
+      "all_tasks": true
+    },
+    "batch_summary": null,
+    "files": [
+      {
+        "filename": "print_全部任务_20260619_125656.json",
+        "file_path": "C:\\Users\\admin\\AppData\\Local\\Temp\\1\\printq_test_tm4l_335\\export\\print_全部任务_20260619_125656.json",
+        "file_size": 1063,
+        "row_count": 2,
+        "content_hash": "3b3049e4a9653c9cc6ae12bc844fad35a45a94aa79119480ecb441db6dfc620b"
+      }
+    ],
+    "statistics": {
+      "row_count": 2,
+      "format": "json"
+    },
+    "content_hash": "3b3049e4a9653c9cc6ae12bc844fad35a45a94aa79119480ecb441db6dfc620b",
+    "version_tag": "v1_20260619_125656",
+    "result_message": "成功导出2条全部任务",
+    "failure_reason": "",
+    "conflict_hint": "none",
+    "conflict_detail": "",
+    "log_entries": []
+  },
+  {
+    "record_id": "exp_1781845173576_c3c013d8",
+    "exported_at": 1781845173.576354,
+    "trigger": "audit_package",
+    "status": "success",
+    "operator": "导出员",
+    "filter_snapshot": {
+      "batch_id": "batch_1781845173559_9fc6",
+      "source_file": "C:\\Users\\admin\\AppData\\Local\\Temp\\1\\playback_test_mn2qelfo\\keep_test.csv"
+    },
+    "batch_summary": {
+      "batch_id": "batch_1781845173559_9fc6",
+      "source_file": "keep_test.csv",
+      "source_format": "csv",
+      "status": "pending",
+      "total_items": 1,
+      "group_counts": {
+        "success": 0,
+        "auto_fixable": 0,
+        "duplicate_conflict": 1,
+        "unimportable": 0
+      }
+    },
+    "files": [
+      {
+        "filename": "audit_batch_batch_1781845173559_9fc6_20260619_125933.json",
+        "file_path": "C:\\Users\\admin\\AppData\\Local\\Temp\\1\\playback_test_mn2qelfo\\exports\\audit_batch_batch_1781845173559_9fc6_20260619_125933.json",
+        "file_size": 3397,
+        "row_count": 1,
+        "content_hash": "fb549041f2dcab67b7b952b3b9809f5d92b53e678bb9a3fbad5407691ccc8835"
+      }
+    ],
+    "statistics": {
+      "total_items": 1,
+      "success_count": 0,
+      "auto_fixable_count": 0,
+      "conflict_count": 1,
+      "unimportable_count": 0
+    },
+    "content_hash": "9bbc418e0b5b96bb2e95e4d660c152b194634ec7762d89d45ca675d9ea36ae43",
+    "version_tag": "v1_batch_178184",
+    "result_message": "审计包导出成功: 1 条记录",
+    "failure_reason": "",
+    "conflict_hint": "none",
+    "conflict_detail": "",
+    "log_entries": []
+  },
+  {
+    "record_id": "exp_1781845178223_1b5d9cf2",
+    "exported_at": 1781845178.2247446,
+    "trigger": "manual_history",
+    "status": "success",
+    "operator": "测试员",
+    "filter_snapshot": {
+      "tag": "历史记录",
+      "format": "csv",
+      "all_tasks": false
+    },
+    "batch_summary": null,
+    "files": [
+      {
+        "filename": "print_历史记录_20260619_125938.csv",
+        "file_path": "C:\\Users\\admin\\AppData\\Local\\Temp\\1\\printq_test_57f4r9c4\\export\\print_历史记录_20260619_125938.csv",
+        "file_size": 357,
+        "row_count": 1,
+        "content_hash": "22af012e0b6f4dc5285648d584fc892891d9cbfb044d392b835f2b3fdac4e199"
+      }
+    ],
+    "statistics": {
+      "row_count": 1,
+      "format": "csv"
+    },
+    "content_hash": "22af012e0b6f4dc5285648d584fc892891d9cbfb044d392b835f2b3fdac4e199",
+    "version_tag": "v1_20260619_125938",
+    "result_message": "成功导出1条历史记录",
+    "failure_reason": "",
+    "conflict_hint": "none",
+    "conflict_detail": "",
+    "log_entries": []
+  },
+  {
+    "record_id": "exp_1781845178238_cc88cb07",
+    "exported_at": 1781845178.2384295,
+    "trigger": "manual_all",
+    "status": "success",
+    "operator": "测试员",
+    "filter_snapshot": {
+      "tag": "全部任务",
+      "format": "json",
+      "all_tasks": true
+    },
+    "batch_summary": null,
+    "files": [
+      {
+        "filename": "print_全部任务_20260619_125938.json",
+        "file_path": "C:\\Users\\admin\\AppData\\Local\\Temp\\1\\printq_test_57f4r9c4\\export\\print_全部任务_20260619_125938.json",
+        "file_size": 1063,
+        "row_count": 2,
+        "content_hash": "564db30e0bfc9e77547adf7f7f9214d8e9b2c8ca9da48aa85b423d8cca6379ec"
+      }
+    ],
+    "statistics": {
+      "row_count": 2,
+      "format": "json"
+    },
+    "content_hash": "564db30e0bfc9e77547adf7f7f9214d8e9b2c8ca9da48aa85b423d8cca6379ec",
+    "version_tag": "v1_20260619_125938",
+    "result_message": "成功导出2条全部任务",
+    "failure_reason": "",
+    "conflict_hint": "none",
+    "conflict_detail": "",
+    "log_entries": []
+  }
+]

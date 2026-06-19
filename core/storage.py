@@ -12,6 +12,8 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 TASKS_FILE = DATA_DIR / "tasks.json"
 CONFIG_FILE = DATA_DIR / "config.json"
 EXPORT_LOG_FILE = DATA_DIR / "export_log.json"
+EXPORT_RECORDS_FILE = DATA_DIR / "export_records.json"
+EXPORT_RECORD_UI_STATE_FILE = DATA_DIR / "export_record_ui_state.json"
 
 
 class Storage:

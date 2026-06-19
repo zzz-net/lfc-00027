@@ -15,7 +15,9 @@ from core.preflight import (
     ConflictResolution, ConflictType, CATEGORY_LABELS, RESOLUTION_LABELS,
 )
 from core.batch_playback import BatchPlaybackManager
+from core.export_record import ExportRecordManager
 from ui.playback_dialog import PlaybackDialog
+from ui.export_record_dialog import ExportRecordDialog
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -54,6 +56,7 @@ class PrintQueueApp:
         self.exporter = HistoryExporter(self.storage)
         self.preflight = PreflightChecker(self.storage)
         self.playback_manager = BatchPlaybackManager(self.storage)
+        self.export_record_manager = ExportRecordManager(self.storage)
         self.queue = QueueManager(
             self.storage, self.config,
             on_tasks_changed=self._on_tasks_changed_ui,
@@ -113,6 +116,7 @@ class PrintQueueApp:
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
         ttk.Button(bar, text="📤 导出历史", command=self._action_export_history).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="📤 导出全部", command=self._action_export_all).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar, text="🗄 导出记录中心", command=self._action_export_record_center).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="� 导出预检日志", command=self._action_export_preflight_logs).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="� 清除已完成", command=self._action_clear_history).pack(side=tk.LEFT, padx=2)
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
@@ -694,6 +698,11 @@ class PrintQueueApp:
 
     def _action_export_all(self):
         self._do_export("all")
+
+    def _action_export_record_center(self):
+        op = self._get_operator()
+        dlg = ExportRecordDialog(self.root, self.export_record_manager, operator=op)
+        self.root.wait_window(dlg)
 
     def _do_export(self, mode: str):
         out_dir = filedialog.askdirectory(title="选择导出目录", initialdir=str(PROJECT_ROOT))
