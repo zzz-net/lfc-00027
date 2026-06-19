@@ -14,6 +14,8 @@ from core.preflight import (
     PreflightChecker, PreflightResult, PreflightCategory,
     ConflictResolution, ConflictType, CATEGORY_LABELS, RESOLUTION_LABELS,
 )
+from core.batch_playback import BatchPlaybackManager
+from ui.playback_dialog import PlaybackDialog
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -51,6 +53,7 @@ class PrintQueueApp:
         self.config = self.storage.load_config()
         self.exporter = HistoryExporter(self.storage)
         self.preflight = PreflightChecker(self.storage)
+        self.playback_manager = BatchPlaybackManager(self.storage)
         self.queue = QueueManager(
             self.storage, self.config,
             on_tasks_changed=self._on_tasks_changed_ui,
@@ -93,6 +96,7 @@ class PrintQueueApp:
         bar.pack(fill=tk.X, pady=(0, 6))
 
         ttk.Button(bar, text="📂 导入任务", command=self._action_import).pack(side=tk.LEFT, padx=3)
+        ttk.Button(bar, text="🎬 决策回放台", command=self._action_playback).pack(side=tk.LEFT, padx=3)
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
 
         ttk.Button(bar, text="⏸ 暂停", command=self._action_pause).pack(side=tk.LEFT, padx=2)
@@ -514,6 +518,15 @@ class PrintQueueApp:
 
     def _get_selected_ids(self) -> List[str]:
         return list(self._selected_task_ids)
+
+    def _action_playback(self):
+        op = self._get_operator()
+        dlg = PlaybackDialog(
+            self.root, self.playback_manager,
+            queue_manager=self.queue, operator=op
+        )
+        self.root.wait_window(dlg)
+        self._refresh_all()
 
     def _action_import(self):
         path = filedialog.askopenfilename(
