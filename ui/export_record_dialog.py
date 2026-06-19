@@ -449,17 +449,19 @@ class ExportRecordDialog(tk.Toplevel):
         if self._selected_record is None:
             return
 
-        detail_state = DetailTabState(
-            tab_index=0,
-            scroll_position=0.0,
-            expanded_sections=[],
-        )
-
+        scroll_pos = 0.0
         try:
             scroll_pos = self._detail_text.yview()[0]
-            detail_state.scroll_position = scroll_pos
         except (tk.TclError, IndexError):
             pass
+
+        preview_file_path = None
+        selected_file_index = 0
+        if self._selected_record.files:
+            selected_file_index = 0
+            first_file = self._selected_record.files[0]
+            if first_file and first_file.file_path:
+                preview_file_path = first_file.file_path
 
         filter_snapshot = {
             "status_filter": self._get_status_filter().value if self._get_status_filter() else None,
@@ -467,17 +469,28 @@ class ExportRecordDialog(tk.Toplevel):
             "search_text": self._search_var.get().strip(),
         }
 
-        detail_state.filter_conditions = filter_snapshot
-
         batch_context = None
         if self._selected_record.batch_summary:
             batch_context = dict(self._selected_record.batch_summary)
 
-        snapshot = self._review_manager.auto_snapshot(
+        from core.review_workbench import SnapshotSaveSource
+
+        detail_state = self._review_manager.state_service.build_detail_state(
+            tab_index=0,
+            scroll_position=scroll_pos,
+            expanded_sections=["export_detail", "file_list", "conflict_panel"],
+            selected_file_index=selected_file_index,
+            timeline_position=None,
+            preview_file_path=preview_file_path,
+            filter_conditions=filter_snapshot,
+        )
+
+        snapshot = self._review_manager.state_service.save_view_state(
             record_id=self._selected_record.record_id,
             detail_state=detail_state,
             filter_snapshot=filter_snapshot,
             batch_context=batch_context,
+            source=SnapshotSaveSource.AUTO_VIEW,
         )
 
         self._auto_snap_var.set(f"✅ 已自动保存查看现场: {snapshot.title[:25]}")
@@ -494,6 +507,48 @@ class ExportRecordDialog(tk.Toplevel):
 
     def _on_close(self):
         if self._selected_record:
-            self._auto_create_snapshot()
+            from core.review_workbench import SnapshotSaveSource
+
+            scroll_pos = 0.0
+            try:
+                scroll_pos = self._detail_text.yview()[0]
+            except (tk.TclError, IndexError):
+                pass
+
+            preview_file_path = None
+            selected_file_index = 0
+            if self._selected_record.files:
+                selected_file_index = 0
+                first_file = self._selected_record.files[0]
+                if first_file and first_file.file_path:
+                    preview_file_path = first_file.file_path
+
+            filter_snapshot = {
+                "status_filter": self._get_status_filter().value if self._get_status_filter() else None,
+                "trigger_filter": self._get_trigger_filter().value if self._get_trigger_filter() else None,
+                "search_text": self._search_var.get().strip(),
+            }
+
+            batch_context = None
+            if self._selected_record.batch_summary:
+                batch_context = dict(self._selected_record.batch_summary)
+
+            detail_state = self._review_manager.state_service.build_detail_state(
+                tab_index=0,
+                scroll_position=scroll_pos,
+                expanded_sections=["export_detail", "file_list", "conflict_panel"],
+                selected_file_index=selected_file_index,
+                timeline_position=None,
+                preview_file_path=preview_file_path,
+                filter_conditions=filter_snapshot,
+            )
+
+            self._review_manager.state_service.save_view_state(
+                record_id=self._selected_record.record_id,
+                detail_state=detail_state,
+                filter_snapshot=filter_snapshot,
+                batch_context=batch_context,
+                source=SnapshotSaveSource.AUTO_CLOSE,
+            )
         self._save_ui_state()
         self.destroy()

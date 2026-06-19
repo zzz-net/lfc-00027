@@ -64,6 +64,12 @@ class DetailTabState:
     preview_file_path: Optional[str] = None
     filter_conditions: Dict[str, Any] = field(default_factory=dict)
 
+    _ALL_FIELDS = (
+        "tab_index", "scroll_position", "expanded_sections",
+        "selected_file_index", "timeline_position",
+        "preview_file_path", "filter_conditions",
+    )
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -80,6 +86,77 @@ class DetailTabState:
             preview_file_path=d.get("preview_file_path"),
             filter_conditions=d.get("filter_conditions", {}),
         )
+
+    @classmethod
+    def missing_fields(cls, d: dict) -> List[str]:
+        if not isinstance(d, dict):
+            return list(cls._ALL_FIELDS)
+        return [k for k in cls._ALL_FIELDS if k not in d]
+
+    def ensure_complete(self) -> "DetailTabState":
+        if self.expanded_sections is None:
+            self.expanded_sections = []
+        if self.filter_conditions is None:
+            self.filter_conditions = {}
+        if not isinstance(self.tab_index, int) or self.tab_index < 0:
+            self.tab_index = 0
+        if not isinstance(self.scroll_position, (int, float)):
+            self.scroll_position = 0.0
+        if not isinstance(self.selected_file_index, int) or self.selected_file_index < 0:
+            self.selected_file_index = 0
+        self.scroll_position = max(0.0, min(1.0, float(self.scroll_position)))
+        return self
+
+    def merge_with(self, other: "DetailTabState",
+                   prefer_other: bool = True) -> "DetailTabState":
+        if prefer_other:
+            if other.tab_index is not None and other.tab_index != 0:
+                self.tab_index = other.tab_index
+            if other.scroll_position is not None and other.scroll_position != 0.0:
+                self.scroll_position = other.scroll_position
+            if other.expanded_sections:
+                merged = list(dict.fromkeys(self.expanded_sections + other.expanded_sections))
+                self.expanded_sections = merged
+            if other.selected_file_index is not None and other.selected_file_index != 0:
+                self.selected_file_index = other.selected_file_index
+            if other.timeline_position is not None:
+                self.timeline_position = other.timeline_position
+            if other.preview_file_path:
+                self.preview_file_path = other.preview_file_path
+            if other.filter_conditions:
+                fc = dict(self.filter_conditions)
+                fc.update(other.filter_conditions)
+                self.filter_conditions = fc
+        else:
+            if self.tab_index == 0 and other.tab_index != 0:
+                self.tab_index = other.tab_index
+            if self.scroll_position == 0.0 and other.scroll_position != 0.0:
+                self.scroll_position = other.scroll_position
+            if not self.expanded_sections and other.expanded_sections:
+                self.expanded_sections = list(other.expanded_sections)
+            if self.selected_file_index == 0 and other.selected_file_index != 0:
+                self.selected_file_index = other.selected_file_index
+            if self.timeline_position is None and other.timeline_position is not None:
+                self.timeline_position = other.timeline_position
+            if not self.preview_file_path and other.preview_file_path:
+                self.preview_file_path = other.preview_file_path
+            if not self.filter_conditions and other.filter_conditions:
+                self.filter_conditions = dict(other.filter_conditions)
+        return self.ensure_complete()
+
+    def describe(self) -> str:
+        parts = [f"tab={self.tab_index}", f"scroll={self.scroll_position:.2f}"]
+        if self.expanded_sections:
+            parts.append(f"expanded={len(self.expanded_sections)}")
+        if self.selected_file_index:
+            parts.append(f"file_idx={self.selected_file_index}")
+        if self.timeline_position is not None:
+            parts.append(f"timeline={self.timeline_position}")
+        if self.preview_file_path:
+            parts.append(f"preview={Path(self.preview_file_path).name}")
+        if self.filter_conditions:
+            parts.append(f"filters={len(self.filter_conditions)}")
+        return ", ".join(parts)
 
 
 @dataclass
@@ -230,6 +307,128 @@ class RecoveryLogEntry:
         )
 
 
+class SnapshotSaveSource(str, Enum):
+    AUTO_VIEW = "auto_view"
+    AUTO_CLOSE = "auto_close"
+    AUTO_TIMER = "auto_timer"
+    MANUAL_UPDATE = "manual_update"
+    MANUAL_CREATE = "manual_create"
+    IMPORT = "import"
+
+
+class SnapshotStateService:
+    def __init__(self, manager: "ReviewWorkbenchManager"):
+        self._mgr = manager
+
+    def build_detail_state(
+        self,
+        tab_index: Optional[int] = None,
+        scroll_position: Optional[float] = None,
+        expanded_sections: Optional[List[str]] = None,
+        selected_file_index: Optional[int] = None,
+        timeline_position: Optional[float] = None,
+        preview_file_path: Optional[str] = None,
+        filter_conditions: Optional[Dict[str, Any]] = None,
+        base_state: Optional[DetailTabState] = None,
+    ) -> DetailTabState:
+        state = base_state or DetailTabState()
+        if tab_index is not None:
+            state.tab_index = tab_index
+        if scroll_position is not None:
+            state.scroll_position = scroll_position
+        if expanded_sections is not None:
+            state.expanded_sections = list(expanded_sections)
+        if selected_file_index is not None:
+            state.selected_file_index = selected_file_index
+        if timeline_position is not None:
+            state.timeline_position = timeline_position
+        if preview_file_path is not None:
+            state.preview_file_path = preview_file_path
+        if filter_conditions is not None:
+            state.filter_conditions = dict(filter_conditions)
+        return state.ensure_complete()
+
+    def save_view_state(
+        self,
+        record_id: str,
+        detail_state: DetailTabState,
+        filter_snapshot: Optional[Dict[str, Any]] = None,
+        batch_context: Optional[Dict[str, Any]] = None,
+        source: SnapshotSaveSource = SnapshotSaveSource.AUTO_VIEW,
+        snapshot_title: Optional[str] = None,
+    ) -> ReviewSnapshot:
+        detail_state = detail_state.ensure_complete()
+        logger.info("[state_service] 保存现场 record=%s source=%s state=[%s]",
+                    record_id, source.value, detail_state.describe())
+
+        if source in (SnapshotSaveSource.AUTO_VIEW,
+                      SnapshotSaveSource.AUTO_CLOSE,
+                      SnapshotSaveSource.AUTO_TIMER):
+            snap = self._mgr.auto_snapshot(
+                record_id=record_id,
+                detail_state=detail_state,
+                filter_snapshot=filter_snapshot,
+                batch_context=batch_context,
+            )
+        elif source == SnapshotSaveSource.MANUAL_CREATE:
+            snap = self._mgr.create_snapshot(
+                record_id=record_id,
+                title=snapshot_title or "",
+                detail_state=detail_state,
+                filter_snapshot=filter_snapshot,
+                batch_context=batch_context,
+            )
+        elif source == SnapshotSaveSource.MANUAL_UPDATE:
+            existing = self._mgr.find_snapshot_by_record(record_id)
+            if existing:
+                snap = self._mgr.update_snapshot(
+                    snapshot_id=existing.snapshot_id,
+                    detail_state=detail_state,
+                    title=snapshot_title,
+                )
+                if snap is None:
+                    snap = self._mgr.create_snapshot(
+                        record_id=record_id,
+                        title=snapshot_title or "",
+                        detail_state=detail_state,
+                        filter_snapshot=filter_snapshot,
+                        batch_context=batch_context,
+                    )
+            else:
+                snap = self._mgr.create_snapshot(
+                    record_id=record_id,
+                    title=snapshot_title or "",
+                    detail_state=detail_state,
+                    filter_snapshot=filter_snapshot,
+                    batch_context=batch_context,
+                )
+        else:
+            snap = self._mgr.auto_snapshot(
+                record_id=record_id,
+                detail_state=detail_state,
+                filter_snapshot=filter_snapshot,
+                batch_context=batch_context,
+            )
+
+        self._mgr._log(
+            action="state_saved",
+            detail=f"通过 {source.value} 保存现场: {detail_state.describe()}",
+            snapshot_id=snap.snapshot_id,
+            record_id=record_id,
+        )
+        return snap
+
+    def validate_state(self, state: DetailTabState,
+                       tab_count: int = 4,
+                       file_count: int = 0) -> DetailTabState:
+        state = state.ensure_complete()
+        if tab_count > 0 and state.tab_index >= tab_count:
+            state.tab_index = max(0, tab_count - 1)
+        if file_count > 0 and state.selected_file_index >= file_count:
+            state.selected_file_index = max(0, file_count - 1)
+        return state
+
+
 class ReviewWorkbenchManager:
     def __init__(self, storage: Optional[Storage] = None,
                  record_manager: Optional[ExportRecordManager] = None):
@@ -238,6 +437,11 @@ class ReviewWorkbenchManager:
         self._lock = threading.RLock()
         self._max_snapshots = 50
         self._active_auto_snapshots: Dict[str, str] = {}
+        self._state_service = SnapshotStateService(self)
+
+    @property
+    def state_service(self) -> SnapshotStateService:
+        return self._state_service
 
     def _log(self, action: str, detail: str,
              snapshot_id: Optional[str] = None,
@@ -308,11 +512,17 @@ class ReviewWorkbenchManager:
                 existing = self._load_snapshot(existing_id)
                 if existing:
                     if detail_state:
-                        existing.detail_state = detail_state
+                        detail_state.ensure_complete()
+                        existing.detail_state.merge_with(detail_state, prefer_other=True)
                     if filter_snapshot:
-                        existing.filter_snapshot = filter_snapshot
+                        merged_fs = dict(existing.filter_snapshot)
+                        merged_fs.update(filter_snapshot)
+                        existing.filter_snapshot = merged_fs
                     if batch_context:
-                        existing.batch_context = batch_context
+                        merged_bc = dict(existing.batch_context) if existing.batch_context else {}
+                        merged_bc.update(batch_context)
+                        existing.batch_context = merged_bc
+                    existing.detail_state.ensure_complete()
                     existing.updated_at = time.time()
                     record = self._record_manager.load_record(record_id)
                     if record:
@@ -320,7 +530,8 @@ class ReviewWorkbenchManager:
                     self._check_snapshot_status(existing)
                     self._save_snapshot(existing)
                     self._save_last_snapshot_id(existing_id)
-                    self._log("auto_snapshot_update", f"更新自动快照: {existing.title}",
+                    self._log("auto_snapshot_update",
+                              f"更新自动快照: {existing.title} state=[{existing.detail_state.describe()}]",
                               snapshot_id=existing_id, record_id=record_id)
                     return existing
 
@@ -338,9 +549,11 @@ class ReviewWorkbenchManager:
             else:
                 title = f"记录 {record_id[:12]}..."
 
-            state = detail_state or DetailTabState()
-            if filter_snapshot and not state.filter_conditions:
-                state.filter_conditions = filter_snapshot
+            state = (detail_state or DetailTabState()).ensure_complete()
+            if filter_snapshot:
+                fc = dict(filter_snapshot)
+                fc.update(state.filter_conditions)
+                state.filter_conditions = fc
 
             snapshot = ReviewSnapshot(
                 snapshot_id=snapshot_id,
@@ -361,7 +574,8 @@ class ReviewWorkbenchManager:
             self._save_last_snapshot_id(snapshot_id)
             self._active_auto_snapshots[record_id] = snapshot_id
 
-            self._log("auto_snapshot_create", f"创建自动快照: {title}",
+            self._log("auto_snapshot_create",
+                      f"创建自动快照: {title} state=[{state.describe()}]",
                       snapshot_id=snapshot_id, record_id=record_id)
 
             return snapshot
@@ -386,6 +600,10 @@ class ReviewWorkbenchManager:
                 t_str = time.strftime("%m-%d %H:%M", time.localtime(record.exported_at))
                 title = f"{record.operator} - {t_str} - {record.result_message[:20]}"
 
+            state = (detail_state or DetailTabState()).ensure_complete()
+            if filter_snapshot and not state.filter_conditions:
+                state.filter_conditions = dict(filter_snapshot)
+
             snapshot = ReviewSnapshot(
                 snapshot_id=snapshot_id,
                 record_id=record_id,
@@ -394,7 +612,7 @@ class ReviewWorkbenchManager:
                 title=title,
                 record_snapshot=record_snapshot,
                 filter_snapshot=filter_snapshot or {},
-                detail_state=detail_state or DetailTabState(),
+                detail_state=state,
                 batch_context=batch_context,
                 format_version=SNAPSHOT_FORMAT_VERSION,
             )
@@ -403,7 +621,8 @@ class ReviewWorkbenchManager:
             self._save_snapshot(snapshot)
             self._save_last_snapshot_id(snapshot_id)
 
-            self._log("snapshot_create", f"创建手动快照: {title}",
+            self._log("snapshot_create",
+                      f"创建手动快照: {title} state=[{state.describe()}]",
                       snapshot_id=snapshot_id, record_id=record_id)
 
             return snapshot
@@ -420,13 +639,19 @@ class ReviewWorkbenchManager:
                 return None
 
             if detail_state:
-                snapshot.detail_state = detail_state
+                detail_state.ensure_complete()
+                snapshot.detail_state.merge_with(detail_state, prefer_other=True)
+                snapshot.detail_state.ensure_complete()
             if title is not None:
                 snapshot.title = title
 
             snapshot.updated_at = time.time()
             self._check_snapshot_status(snapshot)
             self._save_snapshot(snapshot)
+
+            self._log("snapshot_update",
+                      f"更新快照: {snapshot.title} state=[{snapshot.detail_state.describe()}]",
+                      snapshot_id=snapshot_id, record_id=snapshot.record_id)
 
             return snapshot
 

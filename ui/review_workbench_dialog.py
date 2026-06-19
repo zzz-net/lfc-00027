@@ -282,7 +282,8 @@ class ReviewWorkbenchDialog(tk.Toplevel):
         sel = self._snapshot_tree.selection()
         if not sel:
             return
-        self._save_current_state()
+        from core.review_workbench import SnapshotSaveSource
+        self._save_current_state(source=SnapshotSaveSource.MANUAL_UPDATE)
         self._load_snapshot_detail(sel[0])
 
     def _on_snapshot_double_click(self, event):
@@ -498,7 +499,8 @@ class ReviewWorkbenchDialog(tk.Toplevel):
         idx = self._file_combo.current()
         if idx >= 0:
             self._update_file_preview(idx)
-            self._save_current_state()
+            from core.review_workbench import SnapshotSaveSource
+            self._save_current_state(source=SnapshotSaveSource.MANUAL_UPDATE)
 
     def _update_file_preview(self, file_index: int):
         record = self._current_record
@@ -559,46 +561,111 @@ class ReviewWorkbenchDialog(tk.Toplevel):
         if not snapshot:
             return
 
-        state = snapshot.detail_state
+        state = snapshot.detail_state.ensure_complete()
 
-        if 0 <= state.tab_index < len(DETAIL_TABS):
+        tab_count = len(DETAIL_TABS)
+        if 0 <= state.tab_index < tab_count:
             self._detail_notebook.select(state.tab_index)
+        else:
+            self._detail_notebook.select(0)
 
-        current_tab = DETAIL_TABS[state.tab_index] if state.tab_index < len(DETAIL_TABS) else DETAIL_TABS[0]
+        current_tab_idx = self._detail_notebook.index(self._detail_notebook.select())
+        current_tab = DETAIL_TABS[current_tab_idx] if 0 <= current_tab_idx < tab_count else DETAIL_TABS[0]
         if current_tab in self._tab_texts:
             text_widget = self._tab_texts[current_tab]
             try:
-                text_widget.yview_moveto(state.scroll_position)
-            except tk.TclError:
+                scroll_val = max(0.0, min(1.0, float(state.scroll_position)))
+                text_widget.yview_moveto(scroll_val)
+            except (tk.TclError, ValueError):
                 pass
 
-    def _save_current_state(self):
+        if self._current_record and self._current_record.files:
+            file_count = len(self._current_record.files)
+            safe_idx = max(0, min(state.selected_file_index, file_count - 1))
+            if safe_idx < len(self._file_combo["values"]):
+                self._file_combo.current(safe_idx)
+                self._update_file_preview(safe_idx)
+
+        if state.preview_file_path and Path(state.preview_file_path).exists():
+            if self._current_record and self._current_record.files:
+                match_idx = None
+                for i, f in enumerate(self._current_record.files):
+                    if f.file_path and Path(f.file_path) == Path(state.preview_file_path):
+                        match_idx = i
+                        break
+                if match_idx is not None and match_idx < len(self._file_combo["values"]):
+                    self._file_combo.current(match_idx)
+                    self._update_file_preview(match_idx)
+
+    def _save_current_state(self, source=None):
         if not self._auto_save_enabled or not self._current_snapshot:
             return
 
+        from core.review_workbench import SnapshotSaveSource
+
+        if source is None:
+            source = SnapshotSaveSource.AUTO_TIMER
+
         tab_index = self._detail_notebook.index(self._detail_notebook.select())
-        current_tab = DETAIL_TABS[tab_index] if tab_index < len(DETAIL_TABS) else DETAIL_TABS[0]
+        tab_count = len(DETAIL_TABS)
+        if tab_index < 0 or tab_index >= tab_count:
+            tab_index = 0
+        current_tab = DETAIL_TABS[tab_index] if tab_index < tab_count else DETAIL_TABS[0]
 
         scroll_pos = 0.0
         if current_tab in self._tab_texts:
             try:
-                scroll_pos = self._tab_texts[current_tab].yview()[0]
-            except (tk.TclError, IndexError):
+                scroll_result = self._tab_texts[current_tab].yview()
+                if scroll_result and len(scroll_result) >= 1:
+                    scroll_pos = float(scroll_result[0])
+            except (tk.TclError, IndexError, ValueError):
                 pass
 
         file_index = self._file_combo.current()
         if file_index < 0:
             file_index = 0
 
-        state = DetailTabState(
+        preview_file_path = None
+        if self._current_record and self._current_record.files:
+            if 0 <= file_index < len(self._current_record.files):
+                f_entry = self._current_record.files[file_index]
+                if f_entry and f_entry.file_path:
+                    preview_file_path = f_entry.file_path
+
+        expanded_sections = list(self._current_snapshot.detail_state.expanded_sections) \
+            if self._current_snapshot.detail_state.expanded_sections else []
+        if not expanded_sections:
+            expanded_sections = ["health_panel", "file_preview"]
+
+        timeline_position = self._current_snapshot.detail_state.timeline_position \
+            if self._current_snapshot.detail_state.timeline_position is not None else None
+
+        filter_conditions = dict(self._current_snapshot.detail_state.filter_conditions) \
+            if self._current_snapshot.detail_state.filter_conditions else {}
+        if not filter_conditions and self._current_snapshot.filter_snapshot:
+            filter_conditions = dict(self._current_snapshot.filter_snapshot)
+
+        filter_snapshot = dict(self._current_snapshot.filter_snapshot) \
+            if self._current_snapshot.filter_snapshot else {}
+        batch_context = dict(self._current_snapshot.batch_context) \
+            if self._current_snapshot.batch_context else None
+
+        detail_state = self._manager.state_service.build_detail_state(
             tab_index=tab_index,
             scroll_position=scroll_pos,
+            expanded_sections=expanded_sections,
             selected_file_index=file_index,
+            timeline_position=timeline_position,
+            preview_file_path=preview_file_path,
+            filter_conditions=filter_conditions,
         )
 
-        self._manager.update_snapshot(
-            self._current_snapshot.snapshot_id,
-            detail_state=state,
+        self._manager.state_service.save_view_state(
+            record_id=self._current_snapshot.record_id,
+            detail_state=detail_state,
+            filter_snapshot=filter_snapshot,
+            batch_context=batch_context,
+            source=source,
         )
 
     def _on_tab_changed(self, event):
@@ -830,7 +897,8 @@ class ReviewWorkbenchDialog(tk.Toplevel):
             messagebox.showerror("无法打开", f"无法打开文件: {e}", parent=self)
 
     def _on_close(self):
-        self._save_current_state()
+        from core.review_workbench import SnapshotSaveSource
+        self._save_current_state(source=SnapshotSaveSource.AUTO_CLOSE)
         self.destroy()
 
 
