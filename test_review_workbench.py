@@ -21,7 +21,8 @@ from core.export_record import (
 from core.review_workbench import (
     ReviewWorkbenchManager, ReviewSnapshot, DetailTabState,
     SnapshotStatus, SNAPSHOT_STATUS_LABELS, ImportResult,
-    REVIEW_SNAPSHOTS_FILE, LAST_REVIEW_SNAPSHOT_FILE,
+    RecoveryLogEntry, REVIEW_SNAPSHOTS_FILE, LAST_REVIEW_SNAPSHOT_FILE,
+    RECOVERY_LOG_FILE, IMPORT_UNDO_FILE, SNAPSHOT_FORMAT_VERSION,
 )
 from core.batch_playback import BatchPlaybackManager
 
@@ -31,13 +32,14 @@ def log(msg):
 
 
 def _make_tmp_env():
-    tmpdir = tempfile.mkdtemp(prefix="review_wb_test_")
+    tmpdir = tempfile.mkdtemp(prefix="review_rc_test_")
     data_dir = Path(tmpdir) / "data"
     data_dir.mkdir()
 
     import core.storage as st_mod
     import core.export_record as er_mod
     import core.review_workbench as rw_mod
+    import core.batch_playback as pb_mod
 
     orig = {
         "DATA_DIR": st_mod.DATA_DIR,
@@ -50,6 +52,11 @@ def _make_tmp_env():
         "ER_EXPORT_RECORD_UI_STATE_FILE": er_mod.EXPORT_RECORD_UI_STATE_FILE,
         "RW_REVIEW_SNAPSHOTS_FILE": rw_mod.REVIEW_SNAPSHOTS_FILE,
         "RW_LAST_REVIEW_SNAPSHOT_FILE": rw_mod.LAST_REVIEW_SNAPSHOT_FILE,
+        "RW_RECOVERY_LOG_FILE": rw_mod.RECOVERY_LOG_FILE,
+        "RW_IMPORT_UNDO_FILE": rw_mod.IMPORT_UNDO_FILE,
+        "BATCHES_FILE": pb_mod.BATCHES_FILE,
+        "LAST_SUBMITTED_FILE": pb_mod.LAST_SUBMITTED_FILE,
+        "UI_STATE_FILE": pb_mod.UI_STATE_FILE,
     }
 
     st_mod.DATA_DIR = data_dir
@@ -60,15 +67,10 @@ def _make_tmp_env():
     st_mod.EXPORT_RECORD_UI_STATE_FILE = data_dir / "export_record_ui_state.json"
     er_mod.EXPORT_RECORDS_FILE = data_dir / "export_records.json"
     er_mod.EXPORT_RECORD_UI_STATE_FILE = data_dir / "export_record_ui_state.json"
-
-    import core.review_workbench as rw_mod
     rw_mod.REVIEW_SNAPSHOTS_FILE = data_dir / "review_snapshots.json"
     rw_mod.LAST_REVIEW_SNAPSHOT_FILE = data_dir / "last_review_snapshot.json"
-
-    import core.batch_playback as pb_mod
-    orig["BATCHES_FILE"] = pb_mod.BATCHES_FILE
-    orig["LAST_SUBMITTED_FILE"] = pb_mod.LAST_SUBMITTED_FILE
-    orig["UI_STATE_FILE"] = pb_mod.UI_STATE_FILE
+    rw_mod.RECOVERY_LOG_FILE = data_dir / "recovery_log.json"
+    rw_mod.IMPORT_UNDO_FILE = data_dir / "import_undo.json"
     pb_mod.BATCHES_FILE = data_dir / "playback_batches.json"
     pb_mod.LAST_SUBMITTED_FILE = data_dir / "playback_last_submitted.json"
     pb_mod.UI_STATE_FILE = data_dir / "playback_ui_state.json"
@@ -92,12 +94,14 @@ def _restore_env(orig):
     er_mod.EXPORT_RECORD_UI_STATE_FILE = orig["ER_EXPORT_RECORD_UI_STATE_FILE"]
     rw_mod.REVIEW_SNAPSHOTS_FILE = orig["RW_REVIEW_SNAPSHOTS_FILE"]
     rw_mod.LAST_REVIEW_SNAPSHOT_FILE = orig["RW_LAST_REVIEW_SNAPSHOT_FILE"]
+    rw_mod.RECOVERY_LOG_FILE = orig["RW_RECOVERY_LOG_FILE"]
+    rw_mod.IMPORT_UNDO_FILE = orig["RW_IMPORT_UNDO_FILE"]
     pb_mod.BATCHES_FILE = orig["BATCHES_FILE"]
     pb_mod.LAST_SUBMITTED_FILE = orig["LAST_SUBMITTED_FILE"]
     pb_mod.UI_STATE_FILE = orig["UI_STATE_FILE"]
 
 
-def _create_test_record(manager, record_manager, tmpdir, idx=0):
+def _create_test_record(record_manager, tmpdir, idx=0):
     dummy_file = Path(tmpdir) / f"test_export_{idx}.csv"
     dummy_file.write_text(f"test,data\n{idx},{idx * 10}", encoding="utf-8")
     file_hash = compute_file_hash(str(dummy_file))
@@ -122,784 +126,692 @@ def _create_test_record(manager, record_manager, tmpdir, idx=0):
     return record, dummy_file
 
 
-def test_1_create_snapshot_basic():
-    """1. 基础快照创建 - 验证字段完整性"""
+def test_1_auto_snapshot_on_view():
+    """1. 打开详情自动存快照 - 每次查看记录自动落一份可恢复快照"""
     tmpdir, orig = _make_tmp_env()
     try:
         storage = Storage()
         config = storage.load_config()
         storage.save_config(config)
-        record_manager = ExportRecordManager(storage)
-        manager = ReviewWorkbenchManager(storage, record_manager)
+        rm = ExportRecordManager(storage)
+        mgr = ReviewWorkbenchManager(storage, rm)
 
-        record, dummy_file = _create_test_record(manager, record_manager, tmpdir, 0)
+        log("=== 1. 打开详情自动存快照 ===")
 
-        log("=== 1. 基础快照创建 ===")
+        record, _ = _create_test_record(rm, tmpdir, 0)
+        assert len(mgr.list_snapshots()) == 0, "初始应无快照"
 
-        detail_state = DetailTabState(
-            tab_index=1,
-            scroll_position=0.35,
-            expanded_sections=["files", "stats"],
-            selected_file_index=0,
-        )
+        snap = mgr.auto_snapshot(record_id=record.record_id)
+        assert snap is not None, "自动快照应创建成功"
+        assert snap.is_auto is True, "应标记为自动快照"
+        assert snap.record_snapshot is not None, "应保存记录副本"
+        log(f"  自动快照: {snap.title} (is_auto={snap.is_auto})")
 
-        filter_snapshot = {
-            "status_filter": "success",
-            "search_text": "测试",
-        }
+        assert snap.detail_state is not None, "应有详情状态"
+        assert snap.filter_snapshot is not None, "应有筛选快照"
+        log(f"  详情状态: tab={snap.detail_state.tab_index}, "
+            f"scroll={snap.detail_state.scroll_position}")
 
-        snapshot = manager.create_snapshot(
-            record_id=record.record_id,
-            title="测试快照01",
-            detail_state=detail_state,
-            filter_snapshot=filter_snapshot,
-        )
-
-        assert snapshot is not None, "快照应创建成功"
-        assert snapshot.snapshot_id.startswith("rev_"), "快照ID应以rev_开头"
-        assert snapshot.record_id == record.record_id, "记录ID应匹配"
-        assert snapshot.title == "测试快照01", "标题应匹配"
-        assert snapshot.is_pinned is False, "默认不应置顶"
-        assert snapshot.status == SnapshotStatus.NORMAL, "状态应为正常"
-        log(f"  快照ID: {snapshot.snapshot_id}")
-        log(f"  标题: {snapshot.title}")
-        log(f"  状态: {snapshot.status.value}")
-
-        assert snapshot.detail_state.tab_index == 1, "页签索引应保存"
-        assert snapshot.detail_state.scroll_position == 0.35, "滚动位置应保存"
-        assert snapshot.detail_state.expanded_sections == ["files", "stats"], "展开区块应保存"
-        log(f"  详情页签: {snapshot.detail_state.tab_index}")
-        log(f"  滚动位置: {snapshot.detail_state.scroll_position}")
-        log(f"  展开区块: {snapshot.detail_state.expanded_sections}")
-
-        assert snapshot.record_snapshot is not None, "应保存记录副本"
-        assert snapshot.record_snapshot["record_id"] == record.record_id, "记录副本ID应匹配"
-        log("  记录副本保存 OK")
-
-        assert snapshot.filter_snapshot["status_filter"] == "success", "筛选快照应保存"
-        log("  筛选快照保存 OK")
-
-        loaded = manager.get_snapshot(snapshot.snapshot_id)
-        assert loaded is not None, "应能加载快照"
-        assert loaded.snapshot_id == snapshot.snapshot_id, "加载的快照ID应匹配"
-        log("  快照加载验证 OK")
-
-        log("  [OK] 基础快照创建测试通过")
-    finally:
-        _restore_env(orig)
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-def test_2_snapshot_list_and_pinning():
-    """2. 快照列表与置顶功能"""
-    tmpdir, orig = _make_tmp_env()
-    try:
-        storage = Storage()
-        config = storage.load_config()
-        storage.save_config(config)
-        record_manager = ExportRecordManager(storage)
-        manager = ReviewWorkbenchManager(storage, record_manager)
-
-        for i in range(5):
-            record, _ = _create_test_record(manager, record_manager, tmpdir, i)
-            manager.create_snapshot(
-                record_id=record.record_id,
-                title=f"快照{i + 1}",
-            )
-
-        log("=== 2. 快照列表与置顶 ===")
-
-        snapshots = manager.list_snapshots()
-        assert len(snapshots) >= 5, "应有至少5个快照"
+        snapshots = mgr.list_snapshots()
+        assert len(snapshots) == 1, "应有一个快照"
         log(f"  快照总数: {len(snapshots)}")
 
-        middle_id = snapshots[2].snapshot_id
-        result = manager.pin_snapshot(middle_id, True)
-        assert result is True, "置顶操作应成功"
-
-        snapshots_after = manager.list_snapshots()
-        assert snapshots_after[0].snapshot_id == middle_id, "置顶快照应在最前面"
-        assert snapshots_after[0].is_pinned is True, "置顶状态应为True"
-        log(f"  置顶后首个快照: {snapshots_after[0].title} (置顶: {snapshots_after[0].is_pinned})")
-
-        result2 = manager.pin_snapshot(middle_id, False)
-        assert result2 is True, "取消置顶应成功"
-
-        snapshots_final = manager.list_snapshots()
-        assert snapshots_final[0].is_pinned is False, "取消置顶后不应在最前"
-        log("  取消置顶验证 OK")
-
-        log("  [OK] 快照列表与置顶测试通过")
+        record2, _ = _create_test_record(rm, tmpdir, 1)
+        snap2 = mgr.auto_snapshot(record_id=record2.record_id)
+        assert snap2.is_auto is True, "第二条也是自动快照"
+        assert len(mgr.list_snapshots()) == 2, "应有两个快照"
+        log(f"  第二条自动快照: {snap2.title}")
+        log("  [OK] 自动存快照测试通过")
     finally:
         _restore_env(orig)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def test_3_delete_snapshot():
-    """3. 快照删除功能"""
+def test_2_auto_snapshot_updates_existing():
+    """2. 同一记录重复查看更新快照而非新建"""
     tmpdir, orig = _make_tmp_env()
     try:
         storage = Storage()
         config = storage.load_config()
         storage.save_config(config)
-        record_manager = ExportRecordManager(storage)
-        manager = ReviewWorkbenchManager(storage, record_manager)
+        rm = ExportRecordManager(storage)
+        mgr = ReviewWorkbenchManager(storage, rm)
 
-        record, _ = _create_test_record(manager, record_manager, tmpdir, 0)
-        snapshot = manager.create_snapshot(record_id=record.record_id, title="待删除快照")
+        log("=== 2. 同记录重复查看更新快照 ===")
 
-        log("=== 3. 快照删除 ===")
+        record, _ = _create_test_record(rm, tmpdir, 0)
+        snap1 = mgr.auto_snapshot(record_id=record.record_id)
+        assert len(mgr.list_snapshots()) == 1
 
-        before_count = len(manager.list_snapshots())
-        log(f"  删除前: {before_count} 个快照")
-
-        result = manager.delete_snapshot(snapshot.snapshot_id)
-        assert result is True, "删除应成功"
-
-        after_count = len(manager.list_snapshots())
-        assert after_count == before_count - 1, "删除后数量应减少1"
-        log(f"  删除后: {after_count} 个快照")
-
-        loaded = manager.get_snapshot(snapshot.snapshot_id)
-        assert loaded is None, "删除后不应能加载到"
-        log("  删除后加载验证 OK")
-
-        result2 = manager.delete_snapshot("nonexistent_id")
-        assert result2 is False, "删除不存在的快照应返回False"
-        log("  删除不存在快照的边界情况 OK")
-
-        log("  [OK] 快照删除测试通过")
-    finally:
-        _restore_env(orig)
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-def test_4_last_snapshot_tracking():
-    """4. 最近查看快照追踪（跨重启恢复）"""
-    tmpdir, orig = _make_tmp_env()
-    try:
-        storage = Storage()
-        config = storage.load_config()
-        storage.save_config(config)
-        record_manager = ExportRecordManager(storage)
-        manager1 = ReviewWorkbenchManager(storage, record_manager)
-
-        for i in range(3):
-            record, _ = _create_test_record(manager1, record_manager, tmpdir, i)
-            manager1.create_snapshot(record_id=record.record_id, title=f"快照{i}")
-
-        log("=== 4. 最近查看快照追踪 ===")
-
-        last_before = manager1.get_last_snapshot()
-        assert last_before is not None, "应有最近快照"
-        log(f"  初始最近快照: {last_before.title}")
-
-        snapshots = manager1.list_snapshots()
-        target_id = snapshots[1].snapshot_id
-        manager1.set_last_snapshot(target_id)
-
-        last_after = manager1.get_last_snapshot()
-        assert last_after is not None, "设置后应有最近快照"
-        assert last_after.snapshot_id == target_id, "最近快照ID应匹配"
-        log(f"  设置后最近快照: {last_after.title}")
-
-        manager2 = ReviewWorkbenchManager(storage, record_manager)
-        last_restart = manager2.get_last_snapshot()
-        assert last_restart is not None, "重启后应能加载最近快照"
-        assert last_restart.snapshot_id == target_id, "重启后最近快照应一致"
-        log(f"  重启后最近快照: {last_restart.title}")
-        log("  跨重启恢复验证 OK")
-
-        log("  [OK] 最近查看快照追踪测试通过")
-    finally:
-        _restore_env(orig)
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-def test_5_detail_state_persistence():
-    """5. 详情页状态持久化与恢复"""
-    tmpdir, orig = _make_tmp_env()
-    try:
-        storage = Storage()
-        config = storage.load_config()
-        storage.save_config(config)
-        record_manager = ExportRecordManager(storage)
-        manager = ReviewWorkbenchManager(storage, record_manager)
-
-        record, _ = _create_test_record(manager, record_manager, tmpdir, 0)
-
-        log("=== 5. 详情页状态持久化 ===")
-
-        initial_state = DetailTabState(
-            tab_index=2,
-            scroll_position=0.75,
-            expanded_sections=["section1", "section2", "section3"],
-            selected_file_index=0,
-            timeline_position=12.5,
-        )
-
-        snapshot = manager.create_snapshot(
+        state2 = DetailTabState(tab_index=2, scroll_position=0.8)
+        snap2 = mgr.auto_snapshot(
             record_id=record.record_id,
-            title="状态测试快照",
-            detail_state=initial_state,
+            detail_state=state2,
         )
 
-        new_state = DetailTabState(
-            tab_index=3,
-            scroll_position=0.5,
-            expanded_sections=["files"],
-            selected_file_index=0,
-            timeline_position=45.0,
-            preview_file_path="/test/path.csv",
-        )
-
-        updated = manager.update_snapshot(
-            snapshot.snapshot_id,
-            detail_state=new_state,
-            title="更新后的快照",
-        )
-
-        assert updated is not None, "更新应成功"
-        assert updated.detail_state.tab_index == 3, "页签应更新"
-        assert updated.detail_state.scroll_position == 0.5, "滚动位置应更新"
-        assert updated.detail_state.expanded_sections == ["files"], "展开区块应更新"
-        assert updated.detail_state.timeline_position == 45.0, "时间线位置应更新"
-        assert updated.detail_state.preview_file_path == "/test/path.csv", "预览路径应更新"
-        assert updated.title == "更新后的快照", "标题应更新"
-        log(f"  更新后页签: {updated.detail_state.tab_index}")
-        log(f"  更新后滚动: {updated.detail_state.scroll_position}")
-        log(f"  更新后展开: {updated.detail_state.expanded_sections}")
-        log(f"  更新后时间线: {updated.detail_state.timeline_position}")
-
-        loaded = manager.get_snapshot(snapshot.snapshot_id)
-        assert loaded.detail_state.tab_index == 3, "加载后页签应一致"
-        assert loaded.detail_state.scroll_position == 0.5, "加载后滚动位置应一致"
-        log("  持久化加载验证 OK")
-
-        result = manager.update_snapshot("nonexistent", detail_state=new_state)
-        assert result is None, "更新不存在的快照应返回None"
-        log("  更新不存在快照的边界情况 OK")
-
-        log("  [OK] 详情页状态持久化测试通过")
+        assert snap2.snapshot_id == snap1.snapshot_id, "同记录应更新同一快照"
+        assert snap2.detail_state.tab_index == 2, "状态应更新"
+        assert snap2.detail_state.scroll_position == 0.8, "滚动应更新"
+        assert len(mgr.list_snapshots()) == 1, "快照数不应增加"
+        log(f"  快照ID不变: {snap1.snapshot_id == snap2.snapshot_id}")
+        log(f"  状态已更新: tab={snap2.detail_state.tab_index}")
+        log("  [OK] 同记录更新快照测试通过")
     finally:
         _restore_env(orig)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def test_6_adjacent_and_batch_snapshots():
-    """6. 相邻快照与同批次快照导航"""
+def test_3_close_reopen_restore():
+    """3. 关闭重开恢复 - 恢复到上次查看位置"""
     tmpdir, orig = _make_tmp_env()
     try:
         storage = Storage()
         config = storage.load_config()
         storage.save_config(config)
-        record_manager = ExportRecordManager(storage)
-        manager = ReviewWorkbenchManager(storage, record_manager)
+        rm = ExportRecordManager(storage)
+        mgr = ReviewWorkbenchManager(storage, rm)
 
-        log("=== 6. 相邻与同批次导航 ===")
-
-        for i in range(5):
-            record, _ = _create_test_record(manager, record_manager, tmpdir, i)
-            manager.create_snapshot(record_id=record.record_id, title=f"普通快照{i}")
-
-        batch_record, _ = _create_test_record(manager, record_manager, tmpdir, 100)
-        batch_record.batch_summary = {"batch_id": "batch_test_001", "total_items": 10}
-        from core.export_record import EXPORT_RECORDS_FILE
-        all_records = record_manager.load_all_records()
-        for i, r in enumerate(all_records):
-            if r.record_id == batch_record.record_id:
-                all_records[i] = batch_record
-                break
-        with open(EXPORT_RECORDS_FILE, "w", encoding="utf-8") as f:
-            json.dump([r.to_dict() for r in all_records], f, ensure_ascii=False, indent=2)
-
-        batch_snap1 = manager.create_snapshot(
-            record_id=batch_record.record_id,
-            title="批次快照1",
-            batch_context={"batch_id": "batch_test_001", "batch_name": "测试批次"},
-        )
-
-        batch_record2, _ = _create_test_record(manager, record_manager, tmpdir, 101)
-        batch_record2.batch_summary = {"batch_id": "batch_test_001", "total_items": 10}
-        all_records2 = record_manager.load_all_records()
-        for i, r in enumerate(all_records2):
-            if r.record_id == batch_record2.record_id:
-                all_records2[i] = batch_record2
-                break
-        with open(EXPORT_RECORDS_FILE, "w", encoding="utf-8") as f:
-            json.dump([r.to_dict() for r in all_records2], f, ensure_ascii=False, indent=2)
-
-        batch_snap2 = manager.create_snapshot(
-            record_id=batch_record2.record_id,
-            title="批次快照2",
-            batch_context={"batch_id": "batch_test_001", "batch_name": "测试批次"},
-        )
-
-        snapshots = manager.list_snapshots()
-        mid_idx = len(snapshots) // 2
-        mid_id = snapshots[mid_idx].snapshot_id
-
-        prev_s, next_s = manager.get_adjacent_snapshots(mid_id)
-        assert prev_s is not None, "应有上一条"
-        assert next_s is not None, "应有下一条"
-        log(f"  中间快照: {snapshots[mid_idx].title}")
-        log(f"  上一条: {prev_s.title}")
-        log(f"  下一条: {next_s.title}")
-
-        first_id = snapshots[0].snapshot_id
-        prev_first, next_first = manager.get_adjacent_snapshots(first_id)
-        assert prev_first is None, "第一条没有上一条"
-        assert next_first is not None, "第一条有下一条"
-        log("  首条相邻验证 OK")
-
-        last_id = snapshots[-1].snapshot_id
-        prev_last, next_last = manager.get_adjacent_snapshots(last_id)
-        assert prev_last is not None, "最后一条有上一条"
-        assert next_last is None, "最后一条没有下一条"
-        log("  末条相邻验证 OK")
-
-        batch_snaps = manager.get_batch_context_snapshots(batch_snap1)
-        assert len(batch_snaps) >= 1, "应找到同批次快照"
-        assert any(s.snapshot_id == batch_snap2.snapshot_id for s in batch_snaps), "应包含批次快照2"
-        log(f"  同批次快照数: {len(batch_snaps)}")
-
-        log("  [OK] 相邻与同批次导航测试通过")
-    finally:
-        _restore_env(orig)
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-def test_7_snapshot_health_checks():
-    """7. 快照健康检查 - 文件丢失、内容变更、权限不足"""
-    tmpdir, orig = _make_tmp_env()
-    try:
-        storage = Storage()
-        config = storage.load_config()
-        storage.save_config(config)
-        record_manager = ExportRecordManager(storage)
-        manager = ReviewWorkbenchManager(storage, record_manager)
-
-        log("=== 7. 快照健康检查 ===")
-
-        record, file_path = _create_test_record(manager, record_manager, tmpdir, 0)
-        snapshot = manager.create_snapshot(record_id=record.record_id, title="健康测试")
-
-        assert snapshot.status == SnapshotStatus.NORMAL, "初始状态应为正常"
-        health = manager.check_snapshot_health(snapshot)
-        assert health["status"] == SnapshotStatus.NORMAL, "健康检查应为正常"
-        assert health["can_view"] is True, "应可查看"
-        log("  初始正常状态 OK")
-
-        file_path.unlink()
-        log("  模拟删除源文件")
-
-        updated = manager.get_snapshot(snapshot.snapshot_id)
-        manager._check_snapshot_status(updated)
-        assert updated.status == SnapshotStatus.FILE_MISSING, "文件删除后状态应为文件丢失"
-        log(f"  文件删除后状态: {updated.status.value}")
-
-        health_missing = manager.check_snapshot_health(updated)
-        assert health_missing["status"] == SnapshotStatus.FILE_MISSING
-        assert len(health_missing["file_issues"]) >= 1
-        log(f"  文件问题数: {len(health_missing['file_issues'])}")
-
-        record2, file_path2 = _create_test_record(manager, record_manager, tmpdir, 1)
-        snapshot2 = manager.create_snapshot(record_id=record2.record_id, title="变更测试")
-
-        time.sleep(0.1)
-        file_path2.write_text("modified,content\n1,2\n3,4\n5,6", encoding="utf-8")
-        log("  模拟修改文件内容")
-
-        manager._check_snapshot_status(snapshot2)
-        assert snapshot2.status == SnapshotStatus.CONTENT_CHANGED, "内容变更后状态应为内容变更"
-        log(f"  内容变更后状态: {snapshot2.status.value}")
-
-        health_changed = manager.check_snapshot_health(snapshot2)
-        assert health_changed["status"] == SnapshotStatus.CONTENT_CHANGED
-        assert any("已变更" in str(i) for i in health_changed.get("file_issues", []) for i in i.get("issues", [])) or any("已变更" in issue for fi in health_changed.get("file_issues", []) for issue in fi.get("issues", []))
-        log("  内容变更检测 OK")
-
-        record3, _ = _create_test_record(manager, record_manager, tmpdir, 2)
-        snapshot3 = manager.create_snapshot(record_id=record3.record_id, title="记录存在测试")
-
-        from core.export_record import EXPORT_RECORDS_FILE
-        records_remaining = [r for r in record_manager.load_all_records() if r.record_id != record3.record_id]
-        with open(EXPORT_RECORDS_FILE, "w", encoding="utf-8") as f:
-            json.dump([r.to_dict() for r in records_remaining], f, ensure_ascii=False, indent=2)
-        log("  模拟删除原始导出记录")
-
-        snapshot3_record = manager.get_snapshot(snapshot3.snapshot_id)
-        manager._check_snapshot_status(snapshot3_record)
-        assert snapshot3_record.status == SnapshotStatus.RECORD_GONE, "记录删除后应为记录已删除"
-        log(f"  记录删除后状态: {snapshot3_record.status.value}")
-
-        restored_record = manager.get_snapshot_record(snapshot3_record)
-        assert restored_record is not None, "应能从快照恢复记录"
-        assert restored_record.record_id == record3.record_id, "恢复的记录ID应匹配"
-        log("  快照记录副本恢复 OK")
-
-        log("  [OK] 快照健康检查测试通过")
-    finally:
-        _restore_env(orig)
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-def test_8_json_import_export():
-    """8. JSON导入导出 - 迁移功能"""
-    tmpdir, orig = _make_tmp_env()
-    try:
-        storage = Storage()
-        config = storage.load_config()
-        storage.save_config(config)
-        record_manager = ExportRecordManager(storage)
-        manager = ReviewWorkbenchManager(storage, record_manager)
-
-        log("=== 8. JSON导入导出 ===")
+        log("=== 3. 关闭重开恢复 ===")
 
         for i in range(3):
-            record, _ = _create_test_record(manager, record_manager, tmpdir, i)
-            state = DetailTabState(tab_index=i, scroll_position=0.1 * i)
-            manager.create_snapshot(
+            record, _ = _create_test_record(rm, tmpdir, i)
+            state = DetailTabState(
+                tab_index=i % 4,
+                scroll_position=0.1 * (i + 1),
+                expanded_sections=[f"section_{i}"],
+                selected_file_index=0,
+                timeline_position=float(i * 5),
+                preview_file_path=f"/path/file_{i}.csv" if i == 1 else None,
+                filter_conditions={"search": f"test{i}", "status": "success"},
+            )
+            mgr.auto_snapshot(
                 record_id=record.record_id,
-                title=f"导出测试{i}",
                 detail_state=state,
+                filter_snapshot={"search": f"query{i}"},
             )
 
-        export_path = Path(tmpdir) / "exported_snapshots.json"
-        success, msg = manager.export_snapshots(str(export_path))
-        assert success is True, "导出应成功"
-        assert export_path.exists(), "导出文件应存在"
-        log(f"  导出成功: {msg}")
+        snapshots = mgr.list_snapshots()
+        target = snapshots[1]
+        mgr.set_last_snapshot(target.snapshot_id)
+
+        last = mgr.get_last_snapshot()
+        assert last is not None, "应有最近快照"
+        assert last.snapshot_id == target.snapshot_id, "ID应匹配"
+        assert last.detail_state.tab_index == 1, "页签应恢复"
+        assert last.detail_state.scroll_position == 0.2, "滚动位置应恢复"
+        assert last.detail_state.expanded_sections == ["section_1"], "展开区块应恢复"
+        assert last.detail_state.timeline_position == 5.0, "时间线位置应恢复"
+        assert last.detail_state.preview_file_path == "/path/file_1.csv", "预览路径应恢复"
+        assert last.detail_state.filter_conditions.get("search") == "test1", "筛选条件应恢复"
+        log(f"  恢复页签: {last.detail_state.tab_index}")
+        log(f"  恢复滚动: {last.detail_state.scroll_position}")
+        log(f"  恢复展开: {last.detail_state.expanded_sections}")
+        log(f"  恢复时间线: {last.detail_state.timeline_position}")
+        log(f"  恢复预览: {last.detail_state.preview_file_path}")
+        log(f"  恢复筛选: {last.detail_state.filter_conditions}")
+        log("  [OK] 关闭重开恢复测试通过")
+    finally:
+        _restore_env(orig)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_4_cross_restart_full_recovery():
+    """4. 跨重启恢复 - 完整链路"""
+    tmpdir, orig = _make_tmp_env()
+    try:
+        storage = Storage()
+        config = storage.load_config()
+        storage.save_config(config)
+        rm = ExportRecordManager(storage)
+        mgr1 = ReviewWorkbenchManager(storage, rm)
+
+        log("=== 4. 跨重启恢复 ===")
+
+        for i in range(5):
+            record, _ = _create_test_record(rm, tmpdir, i)
+            state = DetailTabState(
+                tab_index=i,
+                scroll_position=0.15 * i,
+                expanded_sections=[f"sec_{i}"],
+                filter_conditions={"key": f"val_{i}"},
+            )
+            snap = mgr1.auto_snapshot(
+                record_id=record.record_id,
+                detail_state=state,
+            )
+            if i == 3:
+                mgr1.pin_snapshot(snap.snapshot_id, True)
+
+        snapshots_before = mgr1.list_snapshots()
+        last_before = mgr1.get_last_snapshot()
+        log(f"  重启前: {len(snapshots_before)} 个快照, 最近: {last_before.title}")
+
+        storage2 = Storage()
+        rm2 = ExportRecordManager(storage2)
+        mgr2 = ReviewWorkbenchManager(storage2, rm2)
+
+        snapshots_after = mgr2.list_snapshots()
+        last_after = mgr2.get_last_snapshot()
+        assert len(snapshots_after) == len(snapshots_before), "快照数应一致"
+        assert last_after is not None, "重启后应有最近快照"
+        assert last_after.snapshot_id == last_before.snapshot_id, "最近快照应一致"
+
+        pinned = [s for s in snapshots_after if s.is_pinned]
+        assert len(pinned) == 1, "置顶应恢复"
+        log(f"  重启后: {len(snapshots_after)} 个快照, 最近: {last_after.title}")
+
+        for s in snapshots_after:
+            assert s.detail_state is not None, f"快照{s.snapshot_id}应有详情状态"
+            assert s.is_auto is True, f"快照{s.snapshot_id}应标记为自动"
+            if s.detail_state.filter_conditions:
+                key = s.detail_state.filter_conditions.get("key", "")
+                assert key.startswith("val_"), f"筛选条件应恢复: {key}"
+        log("  所有快照状态恢复 OK")
+
+        adj_prev, adj_next = mgr2.get_adjacent_snapshots(last_after.snapshot_id)
+        log(f"  上一条: {adj_prev.title if adj_prev else 'None'}")
+        log(f"  下一条: {adj_next.title if adj_next else 'None'}")
+        assert adj_prev is not None or adj_next is not None, "应有相邻快照"
+        log("  [OK] 跨重启恢复测试通过")
+    finally:
+        _restore_env(orig)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_5_import_with_merge_conflict():
+    """5. 导入冲突 - 合并策略"""
+    tmpdir, orig = _make_tmp_env()
+    try:
+        storage = Storage()
+        config = storage.load_config()
+        storage.save_config(config)
+        rm = ExportRecordManager(storage)
+        mgr = ReviewWorkbenchManager(storage, rm)
+
+        log("=== 5. 导入冲突 - 合并策略 ===")
+
+        record, _ = _create_test_record(rm, tmpdir, 0)
+        local_snap = mgr.auto_snapshot(
+            record_id=record.record_id,
+            detail_state=DetailTabState(
+                tab_index=1,
+                scroll_position=0.3,
+                expanded_sections=["local_sec"],
+                filter_conditions={"local_key": "local_val"},
+            ),
+        )
+
+        export_path = Path(tmpdir) / "export_for_merge.json"
+        mgr.export_snapshots(str(export_path))
+
+        from core.review_workbench import REVIEW_SNAPSHOTS_FILE
+        with open(REVIEW_SNAPSHOTS_FILE, "r", encoding="utf-8") as f:
+            all_data = json.load(f)
+
+        for item in all_data:
+            item["detail_state"] = {
+                "tab_index": 3,
+                "scroll_position": 0.7,
+                "expanded_sections": ["imported_sec"],
+                "selected_file_index": 0,
+                "timeline_position": None,
+                "preview_file_path": "/imported/path.csv",
+                "filter_conditions": {"imported_key": "imported_val"},
+            }
+            item["log_entries"] = ["导入方日志条目"]
 
         with open(export_path, "r", encoding="utf-8") as f:
             export_data = json.load(f)
-        assert export_data.get("export_version") == "1.0", "版本号应正确"
-        assert export_data.get("snapshot_count") >= 3, "快照数应正确"
-        assert "snapshots" in export_data, "应有snapshots字段"
-        log(f"  导出版本: {export_data['export_version']}")
-        log(f"  导出数量: {export_data['snapshot_count']}")
+        export_data["snapshots"] = all_data
 
-        tmpdir2 = tempfile.mkdtemp(prefix="review_wb_import_")
-        data_dir2 = Path(tmpdir2) / "data"
-        data_dir2.mkdir()
+        merge_path = Path(tmpdir) / "merge_import.json"
+        with open(merge_path, "w", encoding="utf-8") as f:
+            json.dump(export_data, f, ensure_ascii=False, indent=2)
 
-        import core.storage as st_mod
-        import core.export_record as er_mod
-        import core.review_workbench as rw_mod
+        result = mgr.import_snapshots(str(merge_path), conflict_strategy="merge")
+        assert result.success, "导入应成功"
+        assert result.merged_count >= 1, f"应有合并: merged={result.merged_count}"
+        log(f"  合并数: {result.merged_count}")
+        log(f"  合并消息: {result.messages}")
 
-        orig_data_dir = st_mod.DATA_DIR
-        st_mod.DATA_DIR = data_dir2
-        st_mod.TASKS_FILE = data_dir2 / "tasks.json"
-        st_mod.CONFIG_FILE = data_dir2 / "config.json"
-        st_mod.EXPORT_LOG_FILE = data_dir2 / "export_log.json"
-        st_mod.EXPORT_RECORDS_FILE = data_dir2 / "export_records.json"
-        st_mod.EXPORT_RECORD_UI_STATE_FILE = data_dir2 / "export_record_ui_state.json"
-        er_mod.EXPORT_RECORDS_FILE = data_dir2 / "export_records.json"
-        er_mod.EXPORT_RECORD_UI_STATE_FILE = data_dir2 / "export_record_ui_state.json"
-        rw_mod.REVIEW_SNAPSHOTS_FILE = data_dir2 / "review_snapshots.json"
-        rw_mod.LAST_REVIEW_SNAPSHOT_FILE = data_dir2 / "last_review_snapshot.json"
+        merged_snap = mgr.get_snapshot(local_snap.snapshot_id)
+        assert merged_snap is not None, "合并后应存在"
+        merged_detail = merged_snap.detail_state
 
+        assert "local_sec" in merged_detail.expanded_sections, "本地区块应保留"
+        assert "imported_sec" in merged_detail.expanded_sections, "导入区块应合并"
+        assert "local_key" in merged_detail.filter_conditions, "本地筛选应保留"
+        assert "imported_key" in merged_detail.filter_conditions, "导入筛选应合并"
+        log(f"  展开区块: {merged_detail.expanded_sections}")
+        log(f"  筛选条件: {merged_detail.filter_conditions}")
+
+        has_merge_log = any("合并" in e for e in merged_snap.log_entries)
+        assert has_merge_log, "应有合并日志"
+        log("  合并日志验证 OK")
+        log("  [OK] 导入冲突合并测试通过")
+    finally:
+        _restore_env(orig)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_6_import_all_strategies():
+    """6. 导入全部冲突策略 - skip/overwrite/rename/merge"""
+    tmpdir, orig = _make_tmp_env()
+    try:
+        storage = Storage()
+        config = storage.load_config()
+        storage.save_config(config)
+        rm = ExportRecordManager(storage)
+        mgr = ReviewWorkbenchManager(storage, rm)
+
+        log("=== 6. 全部冲突策略 ===")
+
+        record, _ = _create_test_record(rm, tmpdir, 0)
+        mgr.auto_snapshot(record_id=record.record_id)
+
+        export_path = Path(tmpdir) / "strat_export.json"
+        mgr.export_snapshots(str(export_path))
+
+        r_skip = mgr.import_snapshots(str(export_path), conflict_strategy="skip")
+        assert r_skip.success
+        assert r_skip.skipped_count >= 1, "skip应跳过"
+        assert r_skip.merged_count == 0, "skip不应合并"
+        log(f"  skip: 跳过{r_skip.skipped_count}条")
+
+        r_over = mgr.import_snapshots(str(export_path), conflict_strategy="overwrite")
+        assert r_over.success
+        assert r_over.imported_count >= 1, "overwrite应导入"
+        log(f"  overwrite: 导入{r_over.imported_count}条")
+
+        r_rename = mgr.import_snapshots(str(export_path), conflict_strategy="rename")
+        assert r_rename.success
+        assert r_rename.imported_count >= 1, "rename应导入新ID"
+        log(f"  rename: 导入{r_rename.imported_count}条")
+
+        r_merge = mgr.import_snapshots(str(export_path), conflict_strategy="merge")
+        assert r_merge.success
+        assert r_merge.merged_count >= 1, "merge应合并"
+        log(f"  merge: 合并{r_merge.merged_count}条")
+
+        log("  [OK] 全部冲突策略测试通过")
+    finally:
+        _restore_env(orig)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_7_undo_import():
+    """7. 撤销导入 - 恢复到导入前状态"""
+    tmpdir, orig = _make_tmp_env()
+    try:
+        storage = Storage()
+        config = storage.load_config()
+        storage.save_config(config)
+        rm = ExportRecordManager(storage)
+        mgr = ReviewWorkbenchManager(storage, rm)
+
+        log("=== 7. 撤销导入 ===")
+
+        for i in range(2):
+            record, _ = _create_test_record(rm, tmpdir, i)
+            mgr.auto_snapshot(record_id=record.record_id)
+
+        before_count = len(mgr.list_snapshots())
+        before_ids = {s.snapshot_id for s in mgr.list_snapshots()}
+        log(f"  导入前: {before_count} 个快照")
+
+        export_path = Path(tmpdir) / "undo_export.json"
+        mgr.export_snapshots(str(export_path))
+
+        assert not mgr.can_undo_import(), "导入前不应有撤销"
+        log("  导入前无可撤销 OK")
+
+        result = mgr.import_snapshots(str(export_path), conflict_strategy="rename")
+        assert result.success
+        assert result.undo_available, "导入后应可撤销"
+        after_import_count = len(mgr.list_snapshots())
+        log(f"  导入后: {after_import_count} 个快照")
+
+        assert mgr.can_undo_import(), "应可撤销"
+        log("  can_undo_import = True OK")
+
+        undo_ok, undo_msg = mgr.undo_last_import()
+        assert undo_ok, "撤销应成功"
+        log(f"  撤销消息: {undo_msg}")
+
+        after_undo = mgr.list_snapshots()
+        after_undo_ids = {s.snapshot_id for s in after_undo}
+        assert len(after_undo) == before_count, f"撤销后数量应恢复: {len(after_undo)} != {before_count}"
+        assert after_undo_ids == before_ids, "撤销后ID应一致"
+        log(f"  撤销后: {len(after_undo)} 个快照")
+
+        assert not mgr.can_undo_import(), "撤销后不应再可撤销"
+        log("  撤销后不可再撤销 OK")
+
+        undo2_ok, undo2_msg = mgr.undo_last_import()
+        assert not undo2_ok, "二次撤销应失败"
+        log(f"  二次撤销: {undo2_msg}")
+        log("  [OK] 撤销导入测试通过")
+    finally:
+        _restore_env(orig)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_8_permission_and_file_errors():
+    """8. 权限失败 - 源文件丢失、目录无权限"""
+    tmpdir, orig = _make_tmp_env()
+    try:
+        storage = Storage()
+        config = storage.load_config()
+        storage.save_config(config)
+        rm = ExportRecordManager(storage)
+        mgr = ReviewWorkbenchManager(storage, rm)
+
+        log("=== 8. 权限失败与文件错误 ===")
+
+        record, file_path = _create_test_record(rm, tmpdir, 0)
+        snap = mgr.auto_snapshot(record_id=record.record_id)
+
+        assert snap.status == SnapshotStatus.NORMAL, "初始应为正常"
+        log("  初始正常 OK")
+
+        file_path.unlink()
+        snap_check = mgr.get_snapshot(snap.snapshot_id)
+        mgr._check_snapshot_status(snap_check)
+        assert snap_check.status == SnapshotStatus.FILE_MISSING, "文件丢失应标记"
+        log(f"  文件丢失: {snap_check.status.value}")
+
+        health = mgr.check_snapshot_health(snap_check)
+        assert len(health.get("file_issues", [])) >= 1, "应有文件问题"
+        log(f"  健康检查问题: {health['file_issues'][0]['issues']}")
+
+        readonly_dir = Path(tmpdir) / "readonly"
+        readonly_dir.mkdir()
+        readonly_file = readonly_dir / "test.csv"
+        readonly_file.write_text("data", encoding="utf-8")
+
+        export_path = str(readonly_dir / "output.json")
         try:
-            storage2 = Storage()
-            record_manager2 = ExportRecordManager(storage2)
-            manager2 = ReviewWorkbenchManager(storage2, record_manager2)
-
-            before_count = len(manager2.list_snapshots())
-            log(f"  导入前快照数: {before_count}")
-
-            result = manager2.import_snapshots(str(export_path), conflict_strategy="skip")
-            assert result.success is True, "导入应成功"
-            assert result.imported_count >= 3, "应导入至少3个快照"
-            log(f"  导入结果: 成功{result.imported_count}条, "
-                f"跳过{result.skipped_count}条, "
-                f"冲突{result.conflict_count}条")
-
-            after_count = len(manager2.list_snapshots())
-            assert after_count == before_count + result.imported_count, "导入后数量应增加"
-            log(f"  导入后快照数: {after_count}")
-
-            imported = manager2.list_snapshots()
-            for s in imported:
-                assert s.status in (
-                    SnapshotStatus.NORMAL, SnapshotStatus.FILE_MISSING,
-                    SnapshotStatus.RECORD_GONE, SnapshotStatus.CONTENT_CHANGED,
-                    SnapshotStatus.PERMISSION_DENIED,
-                ), f"导入的快照状态应合理: {s.status.value}"
-                if s.status == SnapshotStatus.RECORD_GONE:
-                    assert s.record_snapshot is not None, "记录已删除的快照应包含记录副本"
-            log("  导入的快照状态验证 OK")
-
-            result_dup = manager2.import_snapshots(str(export_path), conflict_strategy="skip")
-            assert result_dup.conflict_count >= 3, "重复导入应有冲突"
-            assert result_dup.skipped_count >= 3, "跳过策略应跳过冲突项"
-            log(f"  重复导入(skip): 冲突{result_dup.conflict_count}条, 跳过{result_dup.skipped_count}条")
-
-            result_over = manager2.import_snapshots(str(export_path), conflict_strategy="overwrite")
-            assert result_over.imported_count >= 3, "覆盖策略应导入"
-            log(f"  重复导入(overwrite): 导入{result_over.imported_count}条")
-
-            result_rename = manager2.import_snapshots(str(export_path), conflict_strategy="rename")
-            assert result_rename.imported_count >= 3, "重命名策略应导入"
-            total_after = len(manager2.list_snapshots())
-            log(f"  重复导入(rename): 导入{result_rename.imported_count}条, 总数{total_after}")
-
+            os.chmod(str(readonly_dir), 0o444)
+            success, msg = mgr.export_snapshots(export_path)
+            if not success:
+                assert "权限" in msg or "写入" in msg, "应有权限错误提示"
+                log(f"  写入权限错误: {msg[:60]}")
+            else:
+                log("  写入权限测试跳过 (Windows权限模型不同)")
+        except PermissionError as e:
+            log(f"  写入权限异常: {e}")
         finally:
-            st_mod.DATA_DIR = orig_data_dir
-            st_mod.TASKS_FILE = Path(orig_data_dir) / "tasks.json"
-            st_mod.CONFIG_FILE = Path(orig_data_dir) / "config.json"
-            st_mod.EXPORT_LOG_FILE = Path(orig_data_dir) / "export_log.json"
-            st_mod.EXPORT_RECORDS_FILE = Path(orig_data_dir) / "export_records.json"
-            st_mod.EXPORT_RECORD_UI_STATE_FILE = Path(orig_data_dir) / "export_record_ui_state.json"
-            er_mod.EXPORT_RECORDS_FILE = Path(orig_data_dir) / "export_records.json"
-            er_mod.EXPORT_RECORD_UI_STATE_FILE = Path(orig_data_dir) / "export_record_ui_state.json"
-            rw_mod.REVIEW_SNAPSHOTS_FILE = Path(orig_data_dir) / "review_snapshots.json"
-            rw_mod.LAST_REVIEW_SNAPSHOT_FILE = Path(orig_data_dir) / "last_review_snapshot.json"
-            shutil.rmtree(tmpdir2, ignore_errors=True)
+            try:
+                os.chmod(str(readonly_dir), 0o755)
+            except OSError:
+                pass
 
-        bad_path = Path(tmpdir) / "nonexistent.json"
-        result_bad = manager.import_snapshots(str(bad_path))
-        assert result_bad.success is False, "导入不存在文件应失败"
-        assert result_bad.error_count == 1, "应有错误计数"
-        log("  导入不存在文件的错误处理 OK")
+        import_path = Path(tmpdir) / "nonexist_import.json"
+        result = mgr.import_snapshots(str(import_path))
+        assert not result.success
+        assert any("不存在" in m for m in result.messages)
+        log(f"  导入不存在文件: {result.messages[0][:50]}")
 
         bad_json = Path(tmpdir) / "bad.json"
-        bad_json.write_text("this is not json", encoding="utf-8")
-        result_bad2 = manager.import_snapshots(str(bad_json))
-        assert result_bad2.success is False, "格式错误的JSON应失败"
-        log("  导入格式错误文件的错误处理 OK")
-
-        log("  [OK] JSON导入导出测试通过")
+        bad_json.write_text("not json", encoding="utf-8")
+        result2 = mgr.import_snapshots(str(bad_json))
+        assert not result2.success
+        assert any("JSON" in m or "格式" in m for m in result2.messages)
+        log(f"  导入格式错误: {result2.messages[0][:50]}")
+        log("  [OK] 权限失败与文件错误测试通过")
     finally:
         _restore_env(orig)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def test_9_snapshot_record_recovery():
-    """9. 记录副本恢复 - 原记录删除后仍可查看"""
+def test_9_old_snapshot_field_compat():
+    """9. 旧快照字段缺失兼容"""
     tmpdir, orig = _make_tmp_env()
     try:
         storage = Storage()
         config = storage.load_config()
         storage.save_config(config)
-        record_manager = ExportRecordManager(storage)
-        manager = ReviewWorkbenchManager(storage, record_manager)
+        rm = ExportRecordManager(storage)
+        mgr = ReviewWorkbenchManager(storage, rm)
 
-        log("=== 9. 记录副本恢复 ===")
+        log("=== 9. 旧快照字段缺失兼容 ===")
 
-        record, _ = _create_test_record(manager, record_manager, tmpdir, 0)
-        snapshot = manager.create_snapshot(record_id=record.record_id, title="恢复测试")
+        record, _ = _create_test_record(rm, tmpdir, 0)
 
-        assert snapshot.record_snapshot is not None, "应保存记录副本"
-        log("  快照包含记录副本 OK")
+        from core.review_workbench import REVIEW_SNAPSHOTS_FILE
+        old_snap_dict = {
+            "snapshot_id": "old_snap_001",
+            "record_id": record.record_id,
+            "created_at": time.time() - 3600,
+            "updated_at": time.time() - 3600,
+            "title": "旧版快照",
+            "record_snapshot": record.to_dict(),
+            "detail_state": {
+                "tab_index": 1,
+                "scroll_position": 0.5,
+            },
+        }
 
-        from core.export_record import EXPORT_RECORDS_FILE
-        records_after = [r for r in record_manager.load_all_records() if r.record_id != record.record_id]
-        with open(EXPORT_RECORDS_FILE, "w", encoding="utf-8") as f:
-            json.dump([r.to_dict() for r in records_after], f, ensure_ascii=False, indent=2)
+        REVIEW_SNAPSHOTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(REVIEW_SNAPSHOTS_FILE, "w", encoding="utf-8") as f:
+            json.dump([old_snap_dict], f, ensure_ascii=False, indent=2)
 
-        direct_record = record_manager.load_record(record.record_id)
-        assert direct_record is None, "直接加载应找不到记录"
-        log("  原始记录已删除 OK")
+        snapshots = mgr.list_snapshots()
+        assert len(snapshots) >= 1, "应加载旧快照"
 
-        restored = manager.get_snapshot_record(snapshot)
-        assert restored is not None, "应能从快照恢复记录"
-        assert restored.record_id == record.record_id, "恢复的记录ID应匹配"
-        assert restored.operator == record.operator, "恢复的操作者应匹配"
-        assert restored.result_message == record.result_message, "恢复的结果消息应匹配"
-        log(f"  恢复记录ID: {restored.record_id}")
-        log(f"  恢复操作者: {restored.operator}")
+        old = snapshots[0]
+        assert old.snapshot_id == "old_snap_001", "ID应匹配"
+        assert old.format_version == "1.0", "旧快照版本应为1.0"
+        assert old.status == SnapshotStatus.FIELDS_MISSING, f"旧快照应标记字段缺失: {old.status}"
+        log(f"  旧快照状态: {old.status.value}")
 
-        assert len(restored.files) == len(record.files), "文件数应一致"
-        log(f"  恢复文件数: {len(restored.files)}")
+        assert old.detail_state.tab_index == 1, "已有字段应恢复"
+        assert old.detail_state.scroll_position == 0.5, "已有字段应恢复"
+        assert old.detail_state.expanded_sections == [], "缺失字段应补默认值"
+        assert old.detail_state.filter_conditions == {}, "缺失筛选条件应补默认值"
+        log(f"  已有字段恢复 OK")
+        log(f"  缺失字段默认值 OK")
 
-        health = manager.check_snapshot_health(snapshot)
-        assert "记录已被删除" in health.get("issues", [{}])[0].get("message", "") or \
-               any("已删除" in i.get("message", "") for i in health.get("issues", [])), \
-               "健康检查应提示记录已删除"
-        log("  健康检查提示记录删除 OK")
+        has_compat_log = any("字段缺失" in e or "补全" in e for e in old.log_entries)
+        assert has_compat_log, "应有兼容日志"
+        log(f"  兼容日志: {old.log_entries}")
 
-        log("  [OK] 记录副本恢复测试通过")
+        health = mgr.check_snapshot_health(old)
+        has_format_issue = any(i.get("type") == "old_format" for i in health.get("issues", []))
+        assert has_format_issue, "健康检查应提示格式版本差异"
+        log("  格式版本健康检查 OK")
+        log("  [OK] 旧快照字段缺失兼容测试通过")
     finally:
         _restore_env(orig)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def test_10_restart_recovery_full():
-    """10. 完整重启恢复 - 快照、状态、最近记录"""
+def test_10_recovery_log_tracking():
+    """10. 恢复日志追踪 - 可读日志记录所有操作"""
     tmpdir, orig = _make_tmp_env()
     try:
         storage = Storage()
         config = storage.load_config()
         storage.save_config(config)
-        record_manager = ExportRecordManager(storage)
-        manager1 = ReviewWorkbenchManager(storage, record_manager)
+        rm = ExportRecordManager(storage)
+        mgr = ReviewWorkbenchManager(storage, rm)
 
-        log("=== 10. 完整重启恢复 ===")
+        log("=== 10. 恢复日志追踪 ===")
+
+        record, _ = _create_test_record(rm, tmpdir, 0)
+        snap = mgr.auto_snapshot(record_id=record.record_id)
+        mgr.pin_snapshot(snap.snapshot_id, True)
+
+        export_path = Path(tmpdir) / "log_test_export.json"
+        mgr.export_snapshots(str(export_path))
+
+        result = mgr.import_snapshots(str(export_path), conflict_strategy="rename")
+        assert result.success
+
+        mgr.undo_last_import()
+
+        logs = mgr.get_recovery_logs(limit=20)
+        assert len(logs) >= 1, "应有日志记录"
+        log(f"  日志条数: {len(logs)}")
+
+        actions = [l.action for l in logs]
+        assert "auto_snapshot_create" in actions, "应有自动快照创建日志"
+        assert "pin_snapshot" in actions, "应有置顶日志"
+        assert "export" in actions, "应有导出日志"
+        assert "import" in actions, "应有导入日志"
+        assert "undo_import" in actions, "应有撤销日志"
+        log(f"  操作类型: {list(set(actions))}")
+
+        for l in logs:
+            assert l.timestamp > 0, "应有时间戳"
+            assert l.detail, "应有详情"
+            assert l.severity in ("info", "warning", "error"), "应有严重级别"
+        log("  日志格式验证 OK")
+
+        severities = [l.severity for l in logs]
+        assert "info" in severities, "应有info级别"
+        log("  日志级别验证 OK")
+        log("  [OK] 恢复日志追踪测试通过")
+    finally:
+        _restore_env(orig)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_11_snapshot_full_state_capture():
+    """11. 快照完整状态捕获 - 筛选条件、预览文件、时间线停留点"""
+    tmpdir, orig = _make_tmp_env()
+    try:
+        storage = Storage()
+        config = storage.load_config()
+        storage.save_config(config)
+        rm = ExportRecordManager(storage)
+        mgr = ReviewWorkbenchManager(storage, rm)
+
+        log("=== 11. 快照完整状态捕获 ===")
+
+        record, _ = _create_test_record(rm, tmpdir, 0)
+        state = DetailTabState(
+            tab_index=3,
+            scroll_position=0.85,
+            expanded_sections=["overview", "files", "logs", "conflicts"],
+            selected_file_index=0,
+            timeline_position=42.5,
+            preview_file_path="/data/exports/report_2024.csv",
+            filter_conditions={
+                "status_filter": "success",
+                "trigger_filter": "manual_history",
+                "search_text": "重要报告",
+                "date_range": "2024-01-01~2024-12-31",
+            },
+        )
+
+        filter_snap = {
+            "status_filter": "success",
+            "search_text": "重要报告",
+            "date_range": "2024-01-01~2024-12-31",
+        }
+
+        snap = mgr.auto_snapshot(
+            record_id=record.record_id,
+            detail_state=state,
+            filter_snapshot=filter_snap,
+            batch_context={"batch_id": "batch_2024_q4", "total_items": 25},
+        )
+
+        assert snap.detail_state.tab_index == 3, "页签应捕获"
+        assert snap.detail_state.scroll_position == 0.85, "滚动应捕获"
+        assert len(snap.detail_state.expanded_sections) == 4, "展开区块应捕获"
+        assert snap.detail_state.selected_file_index == 0, "选中文件应捕获"
+        assert snap.detail_state.timeline_position == 42.5, "时间线应捕获"
+        assert snap.detail_state.preview_file_path == "/data/exports/report_2024.csv", "预览路径应捕获"
+        assert snap.detail_state.filter_conditions.get("search_text") == "重要报告", "筛选条件应捕获"
+        log(f"  页签: {snap.detail_state.tab_index}")
+        log(f"  滚动: {snap.detail_state.scroll_position}")
+        log(f"  展开: {snap.detail_state.expanded_sections}")
+        log(f"  时间线: {snap.detail_state.timeline_position}")
+        log(f"  预览: {snap.detail_state.preview_file_path}")
+        log(f"  筛选: {snap.detail_state.filter_conditions}")
+
+        assert snap.filter_snapshot.get("search_text") == "重要报告", "顶层筛选快照应捕获"
+        assert snap.batch_context.get("batch_id") == "batch_2024_q4", "批次上下文应捕获"
+        log(f"  顶层筛选: {snap.filter_snapshot}")
+        log(f"  批次上下文: {snap.batch_context}")
+
+        loaded = mgr.get_snapshot(snap.snapshot_id)
+        assert loaded.detail_state.tab_index == 3
+        assert loaded.detail_state.filter_conditions.get("date_range") == "2024-01-01~2024-12-31"
+        log("  持久化加载验证 OK")
+        log("  [OK] 快照完整状态捕获测试通过")
+    finally:
+        _restore_env(orig)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_12_continuous_viewing_chain():
+    """12. 从最近查看列表连续接着看"""
+    tmpdir, orig = _make_tmp_env()
+    try:
+        storage = Storage()
+        config = storage.load_config()
+        storage.save_config(config)
+        rm = ExportRecordManager(storage)
+        mgr = ReviewWorkbenchManager(storage, rm)
+
+        log("=== 12. 连续接着看 ===")
 
         for i in range(5):
-            record, _ = _create_test_record(manager1, record_manager, tmpdir, i)
+            record, _ = _create_test_record(rm, tmpdir, i)
             state = DetailTabState(
-                tab_index=i % 4,
+                tab_index=i,
                 scroll_position=0.1 * i,
-                expanded_sections=[f"section_{i}"],
+                filter_conditions={"page": str(i)},
             )
-            snap = manager1.create_snapshot(
-                record_id=record.record_id,
-                title=f"重启测试{i}",
-                detail_state=state,
-            )
-            if i == 2:
-                manager1.pin_snapshot(snap.snapshot_id, True)
+            mgr.auto_snapshot(record_id=record.record_id, detail_state=state)
 
-        snapshots_before = manager1.list_snapshots()
-        last_snap = manager1.get_last_snapshot()
-        log(f"  重启前快照数: {len(snapshots_before)}")
-        log(f"  重启前最近: {last_snap.title if last_snap else 'None'}")
+        snapshots = mgr.list_snapshots()
+        mgr.set_last_snapshot(snapshots[2].snapshot_id)
 
-        storage2 = Storage()
-        record_manager2 = ExportRecordManager(storage2)
-        manager2 = ReviewWorkbenchManager(storage2, record_manager2)
+        current = mgr.get_last_snapshot()
+        assert current is not None
 
-        snapshots_after = manager2.list_snapshots()
-        assert len(snapshots_after) == len(snapshots_before), "重启后快照数应一致"
-        log(f"  重启后快照数: {len(snapshots_after)}")
+        prev_s, next_s = mgr.get_adjacent_snapshots(current.snapshot_id)
+        assert prev_s is not None, "应有上一条"
+        assert next_s is not None, "应有下一条"
+        log(f"  当前: {current.title} (tab={current.detail_state.tab_index})")
+        log(f"  上一条: {prev_s.title} (tab={prev_s.detail_state.tab_index})")
+        log(f"  下一条: {next_s.title} (tab={next_s.detail_state.tab_index})")
 
-        pinned_after = [s for s in snapshots_after if s.is_pinned]
-        assert len(pinned_after) == 1, "置顶状态应恢复"
-        assert pinned_after[0].title == "重启测试2", "置顶的快照应正确"
-        log(f"  重启后置顶快照: {pinned_after[0].title}")
-
-        last_after = manager2.get_last_snapshot()
-        assert last_after is not None, "重启后应有最近快照"
-        assert last_after.snapshot_id == last_snap.snapshot_id, "最近快照应一致"
-        log(f"  重启后最近快照: {last_after.title}")
-
-        for s_before, s_after in zip(snapshots_before[:3], snapshots_after[:3]):
-            assert s_before.snapshot_id == s_after.snapshot_id
-            assert s_before.detail_state.tab_index == s_after.detail_state.tab_index
-            assert s_before.detail_state.scroll_position == s_after.detail_state.scroll_position
-        log("  详情状态恢复完整 OK")
-
-        log("  [OK] 完整重启恢复测试通过")
+        mgr.set_last_snapshot(prev_s.snapshot_id)
+        prev_prev, prev_next = mgr.get_adjacent_snapshots(prev_s.snapshot_id)
+        assert prev_next is not None and prev_next.snapshot_id == current.snapshot_id
+        log(f"  从上一条继续: 下一条={prev_next.title}")
+        log("  [OK] 连续接着看测试通过")
     finally:
         _restore_env(orig)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def test_11_import_error_handling():
-    """11. 导入错误处理 - 各种异常情况"""
+def test_13_gui_integration_auto_snapshot():
+    """13. GUI集成 - 自动快照与恢复中心"""
     tmpdir, orig = _make_tmp_env()
     try:
         storage = Storage()
         config = storage.load_config()
         storage.save_config(config)
-        record_manager = ExportRecordManager(storage)
-        manager = ReviewWorkbenchManager(storage, record_manager)
-
-        log("=== 11. 导入错误处理 ===")
-
-        missing_file = Path(tmpdir) / "does_not_exist.json"
-        result = manager.import_snapshots(str(missing_file))
-        assert not result.success
-        assert result.error_count == 1
-        assert any("不存在" in m for m in result.messages)
-        log(f"  文件不存在: {result.messages[0][:50]}...")
-
-        bad_format = Path(tmpdir) / "bad_format.json"
-        bad_format.write_text("not json at all", encoding="utf-8")
-        result2 = manager.import_snapshots(str(bad_format))
-        assert not result2.success
-        assert result2.error_count == 1
-        assert any("JSON" in m or "格式" in m for m in result2.messages)
-        log(f"  JSON格式错误: {result2.messages[0][:50]}...")
-
-        missing_snapshots = Path(tmpdir) / "missing_field.json"
-        missing_snapshots.write_text(json.dumps({"version": "1.0", "other": "data"}), encoding="utf-8")
-        result3 = manager.import_snapshots(str(missing_snapshots))
-        assert not result3.success
-        assert any("缺少" in m or "snapshots" in m for m in result3.messages)
-        log(f"  缺少snapshots字段: {result3.messages[0][:50]}...")
-
-        malformed_items = Path(tmpdir) / "malformed.json"
-        malformed_items.write_text(json.dumps({
-            "export_version": "1.0",
-            "snapshots": [
-                {"snapshot_id": "valid_1", "record_id": "rec_1", "title": "valid"},
-                {"bad_item": "no_required_fields"},
-                {"snapshot_id": "valid_2", "record_id": "rec_2", "title": "valid2"},
-            ]
-        }), encoding="utf-8")
-        result4 = manager.import_snapshots(str(malformed_items))
-        assert result4.success
-        assert result4.error_count >= 1
-        assert result4.imported_count >= 1
-        log(f"  部分损坏: 导入{result4.imported_count}条, 错误{result4.error_count}条")
-
-        log("  [OK] 导入错误处理测试通过")
-    finally:
-        _restore_env(orig)
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-def test_12_export_error_handling():
-    """12. 导出错误处理 - 权限不足等"""
-    tmpdir, orig = _make_tmp_env()
-    try:
-        storage = Storage()
-        config = storage.load_config()
-        storage.save_config(config)
-        record_manager = ExportRecordManager(storage)
-        manager = ReviewWorkbenchManager(storage, record_manager)
-
-        record, _ = _create_test_record(manager, record_manager, tmpdir, 0)
-        manager.create_snapshot(record_id=record.record_id, title="导出测试")
-
-        log("=== 12. 导出错误处理 ===")
-
-        invalid_dir = Path(tmpdir) / "nonexistent_dir" / "output.json"
-        success, msg = manager.export_snapshots(str(invalid_dir))
-        assert success is True, "父目录不存在时应自动创建"
-        assert Path(invalid_dir).exists(), "导出文件应存在"
-        log(f"  自动创建父目录: {success}")
-
-        empty_ids_path = Path(tmpdir) / "empty_export.json"
-        success2, msg2 = manager.export_snapshots(str(empty_ids_path), snapshot_ids=["nonexistent"])
-        assert success2 is True, "空列表也应成功导出"
-        log(f"  指定不存在的ID导出: {msg2}")
-
-        log("  [OK] 导出错误处理测试通过")
-    finally:
-        _restore_env(orig)
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-def test_13_gui_level_integration():
-    """13. GUI级集成测试 - 验证模块可正常初始化和交互"""
-    tmpdir, orig = _make_tmp_env()
-    try:
-        storage = Storage()
-        config = storage.load_config()
-        storage.save_config(config)
-        record_manager = ExportRecordManager(storage)
-        manager = ReviewWorkbenchManager(storage, record_manager)
+        rm = ExportRecordManager(storage)
+        mgr = ReviewWorkbenchManager(storage, rm)
 
         for i in range(3):
-            record, _ = _create_test_record(manager, record_manager, tmpdir, i)
-            state = DetailTabState(tab_index=i, scroll_position=0.25 * i)
-            manager.create_snapshot(
-                record_id=record.record_id,
-                title=f"GUI测试快照{i}",
-                detail_state=state,
-            )
+            record, _ = _create_test_record(rm, tmpdir, i)
+            mgr.auto_snapshot(record_id=record.record_id)
 
-        log("=== 13. GUI级集成测试 ===")
+        log("=== 13. GUI集成 ===")
 
         try:
             import tkinter as tk
             has_tk = True
         except ImportError:
             has_tk = False
-            log("  跳过GUI实际渲染测试（无tkinter）")
 
         if has_tk:
             try:
@@ -908,56 +820,41 @@ def test_13_gui_level_integration():
                 root = tk.Tk()
                 root.withdraw()
 
-                dlg = ReviewWorkbenchDialog(
-                    root, manager,
-                    record_manager=record_manager,
-                    operator="GUI测试员",
-                )
+                dlg = ReviewWorkbenchDialog(root, mgr, record_manager=rm, operator="测试员")
+                assert dlg is not None
+                assert dlg.title() == "导出现场恢复中心", f"标题应为恢复中心: {dlg.title()}"
+                log(f"  对话框标题: {dlg.title()}")
 
-                assert dlg is not None, "对话框应创建成功"
-                assert dlg._manager is manager, "管理器应正确设置"
-                assert dlg._record_manager is record_manager, "记录管理器应正确设置"
-                log("  对话框创建成功")
+                tree_count = len(dlg._snapshot_tree.get_children())
+                assert tree_count >= 3, f"列表应显示快照: {tree_count}"
+                log(f"  快照列表: {tree_count} 项")
 
-                assert hasattr(dlg, '_snapshot_tree'), "应有快照列表树"
-                assert hasattr(dlg, '_detail_notebook'), "应详情页签控件"
-                assert hasattr(dlg, '_snapshot_title_var'), "应有标题变量"
-                log("  UI控件完整性验证 OK")
+                assert hasattr(dlg, '_undo_btn'), "应有撤销按钮"
+                log("  撤销按钮存在 OK")
 
-                snap_count = len(dlg._snapshot_tree.get_children())
-                assert snap_count >= 3, "列表应显示快照"
-                log(f"  列表显示快照数: {snap_count}")
-
-                children = dlg._detail_notebook.tabs()
-                assert len(children) >= 4, "详情页应有至少4个页签"
-                log(f"  详情页签数: {len(children)}")
+                snapshots = mgr.list_snapshots()
+                auto_count = sum(1 for s in snapshots if s.is_auto)
+                assert auto_count >= 3, f"自动快照应>=3: {auto_count}"
+                log(f"  自动快照数: {auto_count}")
 
                 dlg.destroy()
                 root.destroy()
-                log("  对话框销毁正常")
-
+                log("  GUI集成验证 OK")
             except Exception as e:
                 log(f"  GUI测试跳过: {e}")
-                import traceback
-                traceback.print_exc()
 
-        from ui.export_record_dialog import ExportRecordDialog
+        from core.review_workbench import DetailTabState, ReviewSnapshot, SnapshotStatus, RecoveryLogEntry
+        assert hasattr(RecoveryLogEntry, 'from_dict')
+        assert hasattr(RecoveryLogEntry, 'to_dict')
+        log("  RecoveryLogEntry序列化 OK")
 
-        test_state = DetailTabState(
-            tab_index=2,
-            scroll_position=0.75,
-            expanded_sections=["a", "b"],
-            selected_file_index=1,
-            timeline_position=10.5,
-        )
-        state_dict = test_state.to_dict()
-        restored = DetailTabState.from_dict(state_dict)
-        assert restored.tab_index == 2
-        assert restored.scroll_position == 0.75
-        assert restored.expanded_sections == ["a", "b"]
-        log("  DetailTabState序列化验证 OK")
+        assert SnapshotStatus.FIELDS_MISSING.value == "fields_missing"
+        log("  FIELDS_MISSING状态 OK")
 
-        log("  [OK] GUI级集成测试通过")
+        assert SNAPSHOT_FORMAT_VERSION == "2.0"
+        log(f"  格式版本: {SNAPSHOT_FORMAT_VERSION}")
+
+        log("  [OK] GUI集成测试通过")
     finally:
         _restore_env(orig)
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -965,19 +862,19 @@ def test_13_gui_level_integration():
 
 def run_all():
     tests = [
-        ("基础快照创建", test_1_create_snapshot_basic),
-        ("快照列表与置顶", test_2_snapshot_list_and_pinning),
-        ("快照删除", test_3_delete_snapshot),
-        ("最近查看追踪", test_4_last_snapshot_tracking),
-        ("详情页状态持久化", test_5_detail_state_persistence),
-        ("相邻与同批次导航", test_6_adjacent_and_batch_snapshots),
-        ("快照健康检查", test_7_snapshot_health_checks),
-        ("JSON导入导出", test_8_json_import_export),
-        ("记录副本恢复", test_9_snapshot_record_recovery),
-        ("完整重启恢复", test_10_restart_recovery_full),
-        ("导入错误处理", test_11_import_error_handling),
-        ("导出错误处理", test_12_export_error_handling),
-        ("GUI级集成", test_13_gui_level_integration),
+        ("打开详情自动存快照", test_1_auto_snapshot_on_view),
+        ("同记录重复查看更新", test_2_auto_snapshot_updates_existing),
+        ("关闭重开恢复", test_3_close_reopen_restore),
+        ("跨重启恢复", test_4_cross_restart_full_recovery),
+        ("导入冲突-合并", test_5_import_with_merge_conflict),
+        ("全部冲突策略", test_6_import_all_strategies),
+        ("撤销导入", test_7_undo_import),
+        ("权限失败与文件错误", test_8_permission_and_file_errors),
+        ("旧快照字段兼容", test_9_old_snapshot_field_compat),
+        ("恢复日志追踪", test_10_recovery_log_tracking),
+        ("快照完整状态捕获", test_11_snapshot_full_state_capture),
+        ("连续接着看", test_12_continuous_viewing_chain),
+        ("GUI集成", test_13_gui_integration_auto_snapshot),
     ]
 
     passed = 0
@@ -989,7 +886,7 @@ def run_all():
             log(f"[OK] {name}")
         except AssertionError as e:
             failed.append((name, f"断言失败: {e}"))
-            log(f"[FAIL] {name} - 断言失败: {e}")
+            log(f"[FAIL] {name} - {e}")
             import traceback
             traceback.print_exc()
         except Exception as e:

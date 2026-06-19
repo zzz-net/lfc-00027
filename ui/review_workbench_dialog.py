@@ -8,6 +8,7 @@ from typing import Optional, List
 from core.review_workbench import (
     ReviewWorkbenchManager, ReviewSnapshot, DetailTabState,
     SnapshotStatus, SNAPSHOT_STATUS_LABELS, ImportResult,
+    RecoveryLogEntry,
 )
 from core.export_record import (
     ExportRecordManager, ExportRecord, ExportFileEntry,
@@ -24,8 +25,8 @@ class ReviewWorkbenchDialog(tk.Toplevel):
                  record_manager: Optional[ExportRecordManager] = None,
                  operator: str = "系统", initial_snapshot_id: Optional[str] = None):
         super().__init__(master)
-        self.title("导出回看工作台")
-        self.geometry("1200x750")
+        self.title("导出现场恢复中心")
+        self.geometry("1200x780")
         self.minsize(1000, 600)
         self.transient(master)
         self.grab_set()
@@ -60,6 +61,7 @@ class ReviewWorkbenchDialog(tk.Toplevel):
         style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 9, "bold"))
         style.configure("Title.TLabel", font=("Microsoft YaHei UI", 11, "bold"))
         style.configure("Section.TLabelframe.Label", font=("Microsoft YaHei UI", 9, "bold"))
+        style.configure("Undo.TButton", foreground="#B45309")
 
         main = ttk.Frame(self, padding=6)
         main.pack(fill=tk.BOTH, expand=True)
@@ -72,7 +74,7 @@ class ReviewWorkbenchDialog(tk.Toplevel):
         bar = ttk.Frame(parent)
         bar.pack(fill=tk.X, pady=(0, 4))
 
-        ttk.Label(bar, text="🔍 导出回看工作台", style="Title.TLabel").pack(side=tk.LEFT)
+        ttk.Label(bar, text="🔍 导出现场恢复中心", style="Title.TLabel").pack(side=tk.LEFT)
 
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
 
@@ -90,8 +92,14 @@ class ReviewWorkbenchDialog(tk.Toplevel):
         ttk.Button(bar, text="📤 导出快照", command=self._action_export).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="📥 导入快照", command=self._action_import).pack(side=tk.LEFT, padx=2)
 
+        self._undo_btn = ttk.Button(bar, text="↩ 撤销导入", command=self._action_undo_import,
+                                    style="Undo.TButton")
+        self._undo_btn.pack(side=tk.LEFT, padx=2)
+        self._update_undo_btn_state()
+
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
 
+        ttk.Button(bar, text="📋 恢复日志", command=self._action_show_logs).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="🔄 刷新", command=self._refresh_snapshot_list).pack(side=tk.LEFT, padx=2)
 
         ttk.Button(bar, text="关闭", command=self._on_close).pack(side=tk.RIGHT, padx=4)
@@ -116,16 +124,18 @@ class ReviewWorkbenchDialog(tk.Toplevel):
         list_frame = ttk.LabelFrame(parent, text=" 📋 最近查看快照 ", padding=4)
         list_frame.pack(fill=tk.BOTH, expand=True)
 
-        columns = ("title", "status", "time")
+        columns = ("title", "status", "time", "source")
         self._snapshot_tree = ttk.Treeview(
             list_frame, columns=columns, show="headings", selectmode="browse"
         )
         self._snapshot_tree.heading("title", text="标题")
         self._snapshot_tree.heading("status", text="状态")
         self._snapshot_tree.heading("time", text="查看时间")
-        self._snapshot_tree.column("title", width=140, anchor=tk.W)
-        self._snapshot_tree.column("status", width=60, anchor=tk.CENTER)
-        self._snapshot_tree.column("time", width=100, anchor=tk.W)
+        self._snapshot_tree.heading("source", text="来源")
+        self._snapshot_tree.column("title", width=120, anchor=tk.W)
+        self._snapshot_tree.column("status", width=55, anchor=tk.CENTER)
+        self._snapshot_tree.column("time", width=85, anchor=tk.W)
+        self._snapshot_tree.column("source", width=40, anchor=tk.CENTER)
 
         self._snapshot_tree.tag_configure("pinned", background="#FEF3C7")
         self._snapshot_tree.tag_configure("normal", background="white")
@@ -234,6 +244,7 @@ class ReviewWorkbenchDialog(tk.Toplevel):
         for s in self._snapshots:
             t_str = time.strftime("%m-%d %H:%M", time.localtime(s.updated_at))
             status_label = SNAPSHOT_STATUS_LABELS.get(s.status, "")
+            source_label = "自动" if s.is_auto else "手动"
 
             tags = []
             if s.is_pinned:
@@ -243,20 +254,23 @@ class ReviewWorkbenchDialog(tk.Toplevel):
 
             if s.status in (SnapshotStatus.FILE_MISSING, SnapshotStatus.RECORD_GONE):
                 tags.append("error")
-            elif s.status in (SnapshotStatus.CONTENT_CHANGED, SnapshotStatus.PERMISSION_DENIED):
+            elif s.status in (SnapshotStatus.CONTENT_CHANGED,
+                              SnapshotStatus.PERMISSION_DENIED,
+                              SnapshotStatus.FIELDS_MISSING):
                 tags.append("warning")
 
             title = f"📌 {s.title}" if s.is_pinned else s.title
-            if len(title) > 28:
-                title = title[:26] + "..."
+            if len(title) > 22:
+                title = title[:20] + "..."
 
             self._snapshot_tree.insert(
                 "", tk.END, iid=s.snapshot_id,
-                values=(title, status_label, t_str),
+                values=(title, status_label, t_str, source_label),
                 tags=tuple(tags),
             )
 
         self._count_var.set(f"共 {len(self._snapshots)} 个快照")
+        self._update_undo_btn_state()
 
     def _select_snapshot_by_id(self, snapshot_id: str):
         if snapshot_id in self._snapshot_tree.get_children():
@@ -295,7 +309,7 @@ class ReviewWorkbenchDialog(tk.Toplevel):
 
         if snapshot.status == SnapshotStatus.NORMAL:
             self._status_label.configure(foreground="#10B981")
-        elif snapshot.status == SnapshotStatus.CONTENT_CHANGED:
+        elif snapshot.status in (SnapshotStatus.CONTENT_CHANGED, SnapshotStatus.FIELDS_MISSING):
             self._status_label.configure(foreground="#F59E0B")
         else:
             self._status_label.configure(foreground="#EF4444")
@@ -343,6 +357,21 @@ class ReviewWorkbenchDialog(tk.Toplevel):
                 overview_lines.append(f"  {k}: {v}")
             overview_lines.append("")
 
+        snapshot = self._current_snapshot
+        if snapshot and snapshot.filter_snapshot:
+            overview_lines.append("【快照筛选条件】")
+            for k, v in snapshot.filter_snapshot.items():
+                if v is not None:
+                    overview_lines.append(f"  {k}: {v}")
+            overview_lines.append("")
+
+        if snapshot and snapshot.detail_state.filter_conditions:
+            overview_lines.append("【详情页筛选条件】")
+            for k, v in snapshot.detail_state.filter_conditions.items():
+                if v is not None:
+                    overview_lines.append(f"  {k}: {v}")
+            overview_lines.append("")
+
         if record.statistics:
             overview_lines.append("【关键统计】")
             for k, v in record.statistics.items():
@@ -358,6 +387,12 @@ class ReviewWorkbenchDialog(tk.Toplevel):
                         overview_lines.append(f"    {sk}: {sv}")
                 else:
                     overview_lines.append(f"  {k}: {v}")
+
+        if snapshot and snapshot.log_entries:
+            overview_lines.append("")
+            overview_lines.append("【快照日志】")
+            for entry in snapshot.log_entries[-10:]:
+                overview_lines.append(f"  {entry}")
 
         self._set_tab_text("详情概览", "\n".join(overview_lines))
 
@@ -589,6 +624,13 @@ class ReviewWorkbenchDialog(tk.Toplevel):
             parts.append(f"{next_s.title[:15]}... ➡")
         self._nav_var.set("  |  ".join(parts) if parts else "")
 
+    def _update_undo_btn_state(self):
+        can_undo = self._manager.can_undo_import()
+        if can_undo:
+            self._undo_btn.configure(state=tk.NORMAL)
+        else:
+            self._undo_btn.configure(state=tk.DISABLED)
+
     def _action_pin(self):
         if not self._current_snapshot:
             messagebox.showinfo("提示", "请先选择一个快照", parent=self)
@@ -688,30 +730,24 @@ class ReviewWorkbenchDialog(tk.Toplevel):
         if not path:
             return
 
-        strategy = messagebox.askquestion(
-            "冲突处理",
-            "遇到同名快照时如何处理？\n\n"
-            "是 = 跳过（保留现有）\n"
-            "否 = 覆盖（用导入的替换）\n"
-            "取消 = 重命名后导入",
-            icon="question",
-            parent=self,
-        )
+        dialog = ConflictStrategyDialog(self)
+        self.wait_window(dialog)
 
-        if strategy == "yes":
-            conflict_strategy = "skip"
-        elif strategy == "no":
-            conflict_strategy = "overwrite"
-        else:
-            conflict_strategy = "rename"
+        if not dialog.result:
+            return
+
+        conflict_strategy = dialog.result
 
         result = self._manager.import_snapshots(path, conflict_strategy)
 
         if result.success:
-            msg_lines = result.messages[-3:]
+            msg_lines = result.messages[-4:]
+            detail = "\n".join(msg_lines)
+            if result.undo_available:
+                detail += "\n\n💡 可点击「↩ 撤销导入」回退此次操作"
             messagebox.showinfo(
                 "导入完成",
-                f"成功导入 {result.imported_count} 个快照\n\n" + "\n".join(msg_lines),
+                f"成功导入 {result.imported_count} 个快照\n\n" + detail,
                 parent=self,
             )
             self._refresh_snapshot_list()
@@ -721,6 +757,57 @@ class ReviewWorkbenchDialog(tk.Toplevel):
                 "\n".join(result.messages),
                 parent=self,
             )
+
+    def _action_undo_import(self):
+        if not messagebox.askyesno(
+            "确认撤销",
+            "确认撤销最近一次导入操作？\n\n"
+            "快照列表将恢复到导入前的状态，之后创建的快照也会被移除。",
+            parent=self,
+        ):
+            return
+
+        success, msg = self._manager.undo_last_import()
+        if success:
+            messagebox.showinfo("撤销成功", msg, parent=self)
+            self._current_snapshot = None
+            self._current_record = None
+            self._refresh_snapshot_list()
+        else:
+            messagebox.showwarning("无法撤销", msg, parent=self)
+
+    def _action_show_logs(self):
+        logs = self._manager.get_recovery_logs(limit=30)
+
+        dlg = tk.Toplevel(self)
+        dlg.title("恢复操作日志")
+        dlg.geometry("700x450")
+        dlg.transient(self)
+        dlg.grab_set()
+
+        text = tk.Text(dlg, wrap=tk.WORD, font=("Consolas", 9),
+                       relief=tk.SUNKEN, bd=1)
+        sb = ttk.Scrollbar(dlg, command=text.yview)
+        text.configure(yscrollcommand=sb.set)
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        if not logs:
+            text.insert(tk.END, "(暂无恢复日志)")
+        else:
+            for log_entry in logs:
+                t_str = time.strftime("%Y-%m-%d %H:%M:%S",
+                                      time.localtime(log_entry.timestamp))
+                severity_icon = {"info": "ℹ", "warning": "⚠", "error": "❌"}.get(
+                    log_entry.severity, "ℹ")
+                line = f"{t_str} {severity_icon} [{log_entry.action}] {log_entry.detail}"
+                if log_entry.snapshot_id:
+                    line += f" (snap={log_entry.snapshot_id[:16]}...)"
+                text.insert(tk.END, line + "\n")
+
+        text.configure(state=tk.DISABLED)
+
+        ttk.Button(dlg, text="关闭", command=dlg.destroy).pack(pady=4)
 
     def _action_open_file(self):
         record = self._current_record
@@ -744,4 +831,60 @@ class ReviewWorkbenchDialog(tk.Toplevel):
 
     def _on_close(self):
         self._save_current_state()
+        self.destroy()
+
+
+class ConflictStrategyDialog(tk.Toplevel):
+    def __init__(self, master):
+        super().__init__(master)
+        self.title="冲突处理策略"
+        self.geometry("420x280")
+        self.transient(master)
+        self.grab_set()
+
+        self.result = None
+
+        main = ttk.Frame(self, padding=16)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(main, text="遇到同名快照时如何处理？",
+                  font=("Microsoft YaHei UI", 10, "bold")).pack(anchor=tk.W, pady=(0, 12))
+
+        strategies = [
+            ("跳过（保留现有）", "skip",
+             "保留本地现有快照，跳过导入的冲突项"),
+            ("覆盖（用导入的替换）", "overwrite",
+             "用导入的快照替换本地同名的快照"),
+            ("另存为新快照", "rename",
+             "为导入的快照生成新ID，同时保留本地和导入的"),
+            ("合并（智能合并双方数据）", "merge",
+             "合并本地和导入快照的数据，保留双方最有价值的信息"),
+        ]
+
+        for label, value, desc in strategies:
+            frame = ttk.Frame(main)
+            frame.pack(fill=tk.X, pady=2)
+            btn = ttk.Radiobutton(frame, text=label, value=value,
+                                  variable=tk.StringVar(value=""),
+                                  command=lambda v=value: self._select(v))
+            btn.pack(anchor=tk.W)
+            ttk.Label(frame, text=f"  {desc}", foreground="#6B7280",
+                      font=("Microsoft YaHei UI", 8)).pack(anchor=tk.W)
+
+        btn_bar = ttk.Frame(main)
+        btn_bar.pack(fill=tk.X, pady=(16, 0))
+        ttk.Button(btn_bar, text="确认", command=self._confirm).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btn_bar, text="取消", command=self._cancel).pack(side=tk.RIGHT, padx=4)
+
+        self._selected = "skip"
+
+    def _select(self, value):
+        self._selected = value
+
+    def _confirm(self):
+        self.result = self._selected
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
         self.destroy()

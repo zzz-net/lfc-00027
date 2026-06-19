@@ -169,10 +169,13 @@ class ExportRecordDialog(tk.Toplevel):
         self._count_var = tk.StringVar(value="共 0 条记录")
         ttk.Label(bar, textvariable=self._count_var, foreground="#6B7280").pack(side=tk.LEFT)
 
+        self._auto_snap_var = tk.StringVar(value="")
+        ttk.Label(bar, textvariable=self._auto_snap_var, foreground="#10B981",
+                  font=("Microsoft YaHei UI", 8)).pack(side=tk.LEFT, padx=12)
+
         ttk.Button(bar, text="关闭", command=self._on_close).pack(side=tk.RIGHT, padx=4)
         ttk.Button(bar, text="🗑 删除选中记录", command=self._action_delete_record).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(bar, text="📷 保存快照", command=self._action_save_snapshot).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(bar, text="🔍 回看工作台", command=self._action_open_workbench).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(bar, text="🔍 恢复中心", command=self._action_open_workbench).pack(side=tk.RIGHT, padx=4)
 
     def _load_initial_state(self):
         ui_state = self._manager.load_ui_state()
@@ -256,6 +259,7 @@ class ExportRecordDialog(tk.Toplevel):
         if not sel:
             self._selected_record = None
             self._update_detail_panel()
+            self._auto_snap_var.set("")
             return
 
         record_id = sel[0]
@@ -263,6 +267,7 @@ class ExportRecordDialog(tk.Toplevel):
         self._update_detail_panel()
         self._update_conflict_panel()
         self._save_ui_state()
+        self._auto_create_snapshot()
 
     def _on_record_double_click(self, event):
         sel = self._tree.selection()
@@ -440,9 +445,8 @@ class ExportRecordDialog(tk.Toplevel):
         )
         self._manager.save_ui_state(state)
 
-    def _action_save_snapshot(self):
+    def _auto_create_snapshot(self):
         if self._selected_record is None:
-            messagebox.showinfo("提示", "请先选择一条导出记录", parent=self)
             return
 
         detail_state = DetailTabState(
@@ -463,22 +467,20 @@ class ExportRecordDialog(tk.Toplevel):
             "search_text": self._search_var.get().strip(),
         }
 
+        detail_state.filter_conditions = filter_snapshot
+
         batch_context = None
         if self._selected_record.batch_summary:
             batch_context = dict(self._selected_record.batch_summary)
 
-        snapshot = self._review_manager.create_snapshot(
+        snapshot = self._review_manager.auto_snapshot(
             record_id=self._selected_record.record_id,
             detail_state=detail_state,
             filter_snapshot=filter_snapshot,
             batch_context=batch_context,
         )
 
-        messagebox.showinfo(
-            "快照已保存",
-            f"已保存查看快照:\n{snapshot.title}\n\n可在'回看工作台'中查看和管理。",
-            parent=self,
-        )
+        self._auto_snap_var.set(f"✅ 已自动保存查看现场: {snapshot.title[:25]}")
 
     def _action_open_workbench(self):
         from ui.review_workbench_dialog import ReviewWorkbenchDialog
@@ -491,5 +493,7 @@ class ExportRecordDialog(tk.Toplevel):
         self._refresh_list()
 
     def _on_close(self):
+        if self._selected_record:
+            self._auto_create_snapshot()
         self._save_ui_state()
         self.destroy()

@@ -120,7 +120,7 @@ class PrintQueueApp:
         ttk.Button(bar, text="📤 导出历史", command=self._action_export_history).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="📤 导出全部", command=self._action_export_all).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="🗄 导出记录中心", command=self._action_export_record_center).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="🔍 回看工作台", command=self._action_review_workbench).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar, text="🔍 恢复中心", command=self._action_review_workbench).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="� 导出预检日志", command=self._action_export_preflight_logs).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="� 清除已完成", command=self._action_clear_history).pack(side=tk.LEFT, padx=2)
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)

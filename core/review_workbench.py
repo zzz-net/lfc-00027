@@ -3,6 +3,8 @@ import os
 import time
 import threading
 import uuid
+import copy
+import logging
 from enum import Enum
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -11,16 +13,23 @@ from typing import List, Optional, Dict, Any, Tuple
 from .storage import Storage
 from .export_record import ExportRecord, ExportRecordManager, ExportFileEntry, compute_file_hash
 
+logger = logging.getLogger(__name__)
+
+SNAPSHOT_FORMAT_VERSION = "2.0"
 
 REVIEW_SNAPSHOTS_FILE = None
 LAST_REVIEW_SNAPSHOT_FILE = None
+RECOVERY_LOG_FILE = None
+IMPORT_UNDO_FILE = None
 
 
 def _init_paths():
-    global REVIEW_SNAPSHOTS_FILE, LAST_REVIEW_SNAPSHOT_FILE
+    global REVIEW_SNAPSHOTS_FILE, LAST_REVIEW_SNAPSHOT_FILE, RECOVERY_LOG_FILE, IMPORT_UNDO_FILE
     from .storage import DATA_DIR
     REVIEW_SNAPSHOTS_FILE = DATA_DIR / "review_snapshots.json"
     LAST_REVIEW_SNAPSHOT_FILE = DATA_DIR / "last_review_snapshot.json"
+    RECOVERY_LOG_FILE = DATA_DIR / "recovery_log.json"
+    IMPORT_UNDO_FILE = DATA_DIR / "import_undo.json"
 
 
 _init_paths()
@@ -32,6 +41,7 @@ class SnapshotStatus(str, Enum):
     CONTENT_CHANGED = "content_changed"
     PERMISSION_DENIED = "permission_denied"
     RECORD_GONE = "record_gone"
+    FIELDS_MISSING = "fields_missing"
 
 
 SNAPSHOT_STATUS_LABELS = {
@@ -40,6 +50,7 @@ SNAPSHOT_STATUS_LABELS = {
     SnapshotStatus.CONTENT_CHANGED: "内容已变更",
     SnapshotStatus.PERMISSION_DENIED: "权限不足",
     SnapshotStatus.RECORD_GONE: "记录已删除",
+    SnapshotStatus.FIELDS_MISSING: "旧版快照(字段缺失)",
 }
 
 
@@ -51,12 +62,15 @@ class DetailTabState:
     selected_file_index: int = 0
     timeline_position: Optional[float] = None
     preview_file_path: Optional[str] = None
+    filter_conditions: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "DetailTabState":
+        if not isinstance(d, dict):
+            d = {}
         return cls(
             tab_index=d.get("tab_index", 0),
             scroll_position=d.get("scroll_position", 0.0),
@@ -64,6 +78,7 @@ class DetailTabState:
             selected_file_index=d.get("selected_file_index", 0),
             timeline_position=d.get("timeline_position"),
             preview_file_path=d.get("preview_file_path"),
+            filter_conditions=d.get("filter_conditions", {}),
         )
 
 
@@ -88,6 +103,9 @@ class ReviewSnapshot:
 
     batch_context: Optional[Dict[str, Any]] = None
 
+    format_version: str = SNAPSHOT_FORMAT_VERSION
+    is_auto: bool = False
+
     def to_dict(self) -> dict:
         return {
             "snapshot_id": self.snapshot_id,
@@ -104,11 +122,44 @@ class ReviewSnapshot:
             "status_detail": self.status_detail,
             "log_entries": self.log_entries,
             "batch_context": self.batch_context,
+            "format_version": self.format_version,
+            "is_auto": self.is_auto,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "ReviewSnapshot":
-        return cls(
+        if not isinstance(d, dict):
+            raise ValueError("快照数据必须是字典")
+
+        missing_fields = []
+        for key in ("snapshot_id", "record_id"):
+            if key not in d:
+                missing_fields.append(key)
+
+        if missing_fields:
+            raise ValueError(f"快照缺少必要字段: {', '.join(missing_fields)}")
+
+        detail_raw = d.get("detail_state", {})
+        if not isinstance(detail_raw, dict):
+            detail_raw = {}
+
+        known_detail_keys = {
+            "tab_index", "scroll_position", "expanded_sections",
+            "selected_file_index", "timeline_position",
+            "preview_file_path", "filter_conditions",
+        }
+        has_missing_detail = any(k not in detail_raw for k in known_detail_keys)
+
+        status_val = d.get("status", SnapshotStatus.NORMAL.value)
+        try:
+            status = SnapshotStatus(status_val)
+        except ValueError:
+            status = SnapshotStatus.NORMAL
+
+        if has_missing_detail and status == SnapshotStatus.NORMAL:
+            status = SnapshotStatus.FIELDS_MISSING
+
+        snapshot = cls(
             snapshot_id=d["snapshot_id"],
             record_id=d["record_id"],
             created_at=d.get("created_at", time.time()),
@@ -118,12 +169,21 @@ class ReviewSnapshot:
             view_order=d.get("view_order", 0),
             record_snapshot=d.get("record_snapshot"),
             filter_snapshot=d.get("filter_snapshot", {}),
-            detail_state=DetailTabState.from_dict(d.get("detail_state", {})),
-            status=SnapshotStatus(d.get("status", SnapshotStatus.NORMAL.value)),
+            detail_state=DetailTabState.from_dict(detail_raw),
+            status=status,
             status_detail=d.get("status_detail", ""),
             log_entries=d.get("log_entries", []),
             batch_context=d.get("batch_context"),
+            format_version=d.get("format_version", "1.0"),
+            is_auto=d.get("is_auto", False),
         )
+
+        if has_missing_detail:
+            snapshot.log_entries.append(
+                f"[{time.strftime('%H:%M:%S')}] 旧版快照字段缺失，已自动补全默认值"
+            )
+
+        return snapshot
 
 
 @dataclass
@@ -133,8 +193,41 @@ class ImportResult:
     skipped_count: int = 0
     conflict_count: int = 0
     error_count: int = 0
+    merged_count: int = 0
     messages: List[str] = field(default_factory=list)
     imported_ids: List[str] = field(default_factory=list)
+    undo_available: bool = False
+
+
+@dataclass
+class RecoveryLogEntry:
+    timestamp: float
+    action: str
+    detail: str
+    snapshot_id: Optional[str] = None
+    record_id: Optional[str] = None
+    severity: str = "info"
+
+    def to_dict(self) -> dict:
+        return {
+            "timestamp": self.timestamp,
+            "action": self.action,
+            "detail": self.detail,
+            "snapshot_id": self.snapshot_id,
+            "record_id": self.record_id,
+            "severity": self.severity,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RecoveryLogEntry":
+        return cls(
+            timestamp=d.get("timestamp", time.time()),
+            action=d.get("action", ""),
+            detail=d.get("detail", ""),
+            snapshot_id=d.get("snapshot_id"),
+            record_id=d.get("record_id"),
+            severity=d.get("severity", "info"),
+        )
 
 
 class ReviewWorkbenchManager:
@@ -144,6 +237,134 @@ class ReviewWorkbenchManager:
         self._record_manager = record_manager or ExportRecordManager(self._storage)
         self._lock = threading.RLock()
         self._max_snapshots = 50
+        self._active_auto_snapshots: Dict[str, str] = {}
+
+    def _log(self, action: str, detail: str,
+             snapshot_id: Optional[str] = None,
+             record_id: Optional[str] = None,
+             severity: str = "info"):
+        entry = RecoveryLogEntry(
+            timestamp=time.time(),
+            action=action,
+            detail=detail,
+            snapshot_id=snapshot_id,
+            record_id=record_id,
+            severity=severity,
+        )
+        self._append_log(entry)
+        log_level = {
+            "info": logging.INFO,
+            "warning": logging.WARNING,
+            "error": logging.ERROR,
+        }.get(severity, logging.INFO)
+        logger.log(log_level, "[%s] %s (snap=%s rec=%s)", action, detail,
+                   snapshot_id, record_id)
+
+    def _append_log(self, entry: RecoveryLogEntry):
+        if RECOVERY_LOG_FILE is None:
+            _init_paths()
+        try:
+            RECOVERY_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            logs = []
+            if RECOVERY_LOG_FILE.exists():
+                try:
+                    with open(RECOVERY_LOG_FILE, "r", encoding="utf-8") as f:
+                        logs = json.load(f)
+                except (json.JSONDecodeError, ValueError):
+                    logs = []
+            logs.append(entry.to_dict())
+            logs = logs[-200:]
+            tmp = RECOVERY_LOG_FILE.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(logs, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, RECOVERY_LOG_FILE)
+        except Exception as e:
+            logger.error("写入恢复日志失败: %s", e)
+
+    def get_recovery_logs(self, limit: int = 50) -> List[RecoveryLogEntry]:
+        if RECOVERY_LOG_FILE is None:
+            _init_paths()
+        if not RECOVERY_LOG_FILE.exists():
+            return []
+        try:
+            with open(RECOVERY_LOG_FILE, "r", encoding="utf-8") as f:
+                logs = json.load(f)
+            entries = [RecoveryLogEntry.from_dict(d) for d in logs[-limit:]]
+            entries.reverse()
+            return entries
+        except (json.JSONDecodeError, ValueError):
+            return []
+
+    def auto_snapshot(
+        self,
+        record_id: str,
+        detail_state: Optional[DetailTabState] = None,
+        filter_snapshot: Optional[Dict[str, Any]] = None,
+        batch_context: Optional[Dict[str, Any]] = None,
+    ) -> ReviewSnapshot:
+        with self._lock:
+            if record_id in self._active_auto_snapshots:
+                existing_id = self._active_auto_snapshots[record_id]
+                existing = self._load_snapshot(existing_id)
+                if existing:
+                    if detail_state:
+                        existing.detail_state = detail_state
+                    if filter_snapshot:
+                        existing.filter_snapshot = filter_snapshot
+                    if batch_context:
+                        existing.batch_context = batch_context
+                    existing.updated_at = time.time()
+                    record = self._record_manager.load_record(record_id)
+                    if record:
+                        existing.record_snapshot = record.to_dict()
+                    self._check_snapshot_status(existing)
+                    self._save_snapshot(existing)
+                    self._save_last_snapshot_id(existing_id)
+                    self._log("auto_snapshot_update", f"更新自动快照: {existing.title}",
+                              snapshot_id=existing_id, record_id=record_id)
+                    return existing
+
+            record = self._record_manager.load_record(record_id)
+            snapshot_id = f"rev_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+
+            record_snapshot = None
+            if record:
+                record_snapshot = record.to_dict()
+
+            title = ""
+            if record:
+                t_str = time.strftime("%m-%d %H:%M", time.localtime(record.exported_at))
+                title = f"{record.operator} - {t_str} - {record.result_message[:20]}"
+            else:
+                title = f"记录 {record_id[:12]}..."
+
+            state = detail_state or DetailTabState()
+            if filter_snapshot and not state.filter_conditions:
+                state.filter_conditions = filter_snapshot
+
+            snapshot = ReviewSnapshot(
+                snapshot_id=snapshot_id,
+                record_id=record_id,
+                created_at=time.time(),
+                updated_at=time.time(),
+                title=title,
+                record_snapshot=record_snapshot,
+                filter_snapshot=filter_snapshot or {},
+                detail_state=state,
+                batch_context=batch_context,
+                is_auto=True,
+                format_version=SNAPSHOT_FORMAT_VERSION,
+            )
+
+            self._check_snapshot_status(snapshot)
+            self._save_snapshot(snapshot)
+            self._save_last_snapshot_id(snapshot_id)
+            self._active_auto_snapshots[record_id] = snapshot_id
+
+            self._log("auto_snapshot_create", f"创建自动快照: {title}",
+                      snapshot_id=snapshot_id, record_id=record_id)
+
+            return snapshot
 
     def create_snapshot(
         self,
@@ -175,11 +396,15 @@ class ReviewWorkbenchManager:
                 filter_snapshot=filter_snapshot or {},
                 detail_state=detail_state or DetailTabState(),
                 batch_context=batch_context,
+                format_version=SNAPSHOT_FORMAT_VERSION,
             )
 
             self._check_snapshot_status(snapshot)
             self._save_snapshot(snapshot)
             self._save_last_snapshot_id(snapshot_id)
+
+            self._log("snapshot_create", f"创建手动快照: {title}",
+                      snapshot_id=snapshot_id, record_id=record_id)
 
             return snapshot
 
@@ -214,7 +439,10 @@ class ReviewWorkbenchManager:
         if record:
             return record
         if snapshot.record_snapshot:
-            return ExportRecord.from_dict(snapshot.record_snapshot)
+            try:
+                return ExportRecord.from_dict(snapshot.record_snapshot)
+            except (KeyError, ValueError, TypeError):
+                return None
         return None
 
     def list_snapshots(self, include_record_gone: bool = True) -> List[ReviewSnapshot]:
@@ -230,6 +458,14 @@ class ReviewWorkbenchManager:
             snapshots.sort(key=lambda s: (-s.is_pinned, s.view_order, -s.updated_at))
             return snapshots
 
+    def find_snapshot_by_record(self, record_id: str) -> Optional[ReviewSnapshot]:
+        with self._lock:
+            snapshots = self._load_all_snapshots()
+            for s in reversed(snapshots):
+                if s.record_id == record_id:
+                    return s
+            return None
+
     def pin_snapshot(self, snapshot_id: str, pinned: bool = True) -> bool:
         with self._lock:
             snapshot = self._load_snapshot(snapshot_id)
@@ -238,6 +474,8 @@ class ReviewWorkbenchManager:
             snapshot.is_pinned = pinned
             snapshot.updated_at = time.time()
             self._save_snapshot(snapshot)
+            self._log("pin_snapshot", f"{'置顶' if pinned else '取消置顶'}: {snapshot.title}",
+                      snapshot_id=snapshot_id)
             return True
 
     def set_view_order(self, snapshot_id: str, order: int) -> bool:
@@ -253,6 +491,12 @@ class ReviewWorkbenchManager:
     def delete_snapshot(self, snapshot_id: str) -> bool:
         with self._lock:
             snapshots = self._load_all_snapshots()
+            target = None
+            for s in snapshots:
+                if s.snapshot_id == snapshot_id:
+                    target = s
+                    break
+
             new_snapshots = [s for s in snapshots if s.snapshot_id != snapshot_id]
             if len(new_snapshots) == len(snapshots):
                 return False
@@ -261,6 +505,14 @@ class ReviewWorkbenchManager:
             last_id = self._load_last_snapshot_id()
             if last_id == snapshot_id:
                 self._save_last_snapshot_id(None)
+
+            if target:
+                for rid, sid in list(self._active_auto_snapshots.items()):
+                    if sid == snapshot_id:
+                        del self._active_auto_snapshots[rid]
+
+            self._log("delete_snapshot", f"删除快照: {target.title if target else snapshot_id}",
+                      snapshot_id=snapshot_id, severity="warning")
 
             return True
 
@@ -306,6 +558,13 @@ class ReviewWorkbenchManager:
     def check_snapshot_health(self, snapshot: ReviewSnapshot) -> Dict[str, Any]:
         issues = []
 
+        if snapshot.format_version != SNAPSHOT_FORMAT_VERSION:
+            issues.append({
+                "type": "old_format",
+                "severity": "info",
+                "message": f"快照格式版本 {snapshot.format_version}，当前版本 {SNAPSHOT_FORMAT_VERSION}，部分字段可能缺失",
+            })
+
         record = self._record_manager.load_record(snapshot.record_id)
         if not record:
             issues.append({
@@ -315,7 +574,14 @@ class ReviewWorkbenchManager:
             })
             record_data = snapshot.record_snapshot
             if record_data:
-                record = ExportRecord.from_dict(record_data)
+                try:
+                    record = ExportRecord.from_dict(record_data)
+                except (KeyError, ValueError, TypeError):
+                    return {
+                        "status": SnapshotStatus.RECORD_GONE,
+                        "issues": issues,
+                        "can_view": False,
+                    }
             else:
                 return {
                     "status": SnapshotStatus.RECORD_GONE,
@@ -358,6 +624,7 @@ class ReviewWorkbenchManager:
                 file_issues.append(entry)
 
         record_gone = any(i.get("type") == "record_gone" for i in issues)
+        old_format = any(i.get("type") == "old_format" for i in issues)
 
         overall_status = SnapshotStatus.NORMAL
         if record_gone:
@@ -371,6 +638,8 @@ class ReviewWorkbenchManager:
                 overall_status = SnapshotStatus.PERMISSION_DENIED
             else:
                 overall_status = SnapshotStatus.CONTENT_CHANGED
+        elif old_format:
+            overall_status = SnapshotStatus.FIELDS_MISSING
 
         can_view = snapshot.record_snapshot is not None or not record_gone
 
@@ -389,7 +658,7 @@ class ReviewWorkbenchManager:
                     snapshots = [s for s in snapshots if s.snapshot_id in snapshot_ids]
 
                 data = {
-                    "export_version": "1.0",
+                    "export_version": "2.0",
                     "exported_at": time.time(),
                     "snapshot_count": len(snapshots),
                     "snapshots": [s.to_dict() for s in snapshots],
@@ -401,10 +670,13 @@ class ReviewWorkbenchManager:
                     json.dump(data, f, ensure_ascii=False, indent=2)
                 os.replace(tmp_path, output_path)
 
+                self._log("export", f"导出 {len(snapshots)} 个快照到 {output_path}")
                 return True, f"成功导出 {len(snapshots)} 个快照"
             except PermissionError as e:
+                self._log("export_fail", f"权限不足: {output_path} - {e}", severity="error")
                 return False, f"权限不足，无法写入文件: {e}"
             except OSError as e:
+                self._log("export_fail", f"写入失败: {output_path} - {e}", severity="error")
                 return False, f"写入文件失败: {e}"
 
     def import_snapshots(self, input_path: str, conflict_strategy: str = "skip") -> ImportResult:
@@ -414,77 +686,223 @@ class ReviewWorkbenchManager:
             try:
                 with open(input_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-
-                if not isinstance(data, dict) or "snapshots" not in data:
-                    result.messages.append("文件格式错误：缺少 snapshots 字段")
-                    result.error_count = 1
-                    return result
-
-                imported_data = data["snapshots"]
-                existing = self._load_all_snapshots()
-                existing_ids = {s.snapshot_id: s for s in existing}
-
-                new_snapshots = []
-                for item in imported_data:
-                    try:
-                        snapshot = ReviewSnapshot.from_dict(item)
-                    except (KeyError, ValueError) as e:
-                        result.error_count += 1
-                        result.messages.append(f"跳过格式错误的快照: {e}")
-                        continue
-
-                    if snapshot.snapshot_id in existing_ids:
-                        result.conflict_count += 1
-                        if conflict_strategy == "skip":
-                            result.skipped_count += 1
-                            result.messages.append(
-                                f"跳过同名快照: {snapshot.snapshot_id} ({snapshot.title[:30]})"
-                            )
-                            continue
-                        elif conflict_strategy == "overwrite":
-                            result.messages.append(
-                                f"覆盖同名快照: {snapshot.snapshot_id}"
-                            )
-                        elif conflict_strategy == "rename":
-                            new_id = f"{snapshot.snapshot_id}_imported_{int(time.time())}"
-                            snapshot.snapshot_id = new_id
-                            result.messages.append(
-                                f"重命名导入快照: {new_id}"
-                            )
-                        else:
-                            result.skipped_count += 1
-                            continue
-
-                    self._check_snapshot_status(snapshot)
-                    new_snapshots.append(snapshot)
-                    result.imported_count += 1
-                    result.imported_ids.append(snapshot.snapshot_id)
-
-                merged = existing + new_snapshots
-                merged = merged[-self._max_snapshots:]
-                self._save_all_snapshots(merged)
-
-                result.success = True
-                result.messages.append(
-                    f"导入完成: 成功{result.imported_count}条, "
-                    f"跳过{result.skipped_count}条, "
-                    f"冲突{result.conflict_count}条, "
-                    f"错误{result.error_count}条"
-                )
-                return result
-
             except FileNotFoundError:
                 result.messages.append("导入文件不存在")
                 result.error_count = 1
+                self._log("import_fail", f"文件不存在: {input_path}", severity="error")
                 return result
             except PermissionError as e:
                 result.messages.append(f"权限不足，无法读取文件: {e}")
                 result.error_count = 1
+                self._log("import_fail", f"权限不足: {input_path} - {e}", severity="error")
                 return result
             except json.JSONDecodeError as e:
                 result.messages.append(f"JSON 格式错误: {e}")
                 result.error_count = 1
+                self._log("import_fail", f"JSON格式错误: {input_path} - {e}", severity="error")
                 return result
+
+            if not isinstance(data, dict) or "snapshots" not in data:
+                result.messages.append("文件格式错误：缺少 snapshots 字段")
+                result.error_count = 1
+                self._log("import_fail", f"缺少snapshots字段: {input_path}", severity="error")
+                return result
+
+            imported_data = data["snapshots"]
+            existing = self._load_all_snapshots()
+            existing_ids = {s.snapshot_id: s for s in existing}
+
+            pre_import_backup = [s.to_dict() for s in existing]
+
+            new_snapshots = []
+            overwritten_ids = []
+
+            for item in imported_data:
+                try:
+                    snapshot = ReviewSnapshot.from_dict(item)
+                except (KeyError, ValueError) as e:
+                    result.error_count += 1
+                    result.messages.append(f"跳过格式错误的快照: {e}")
+                    self._log("import_skip", f"格式错误: {e}", severity="warning")
+                    continue
+
+                if snapshot.snapshot_id in existing_ids:
+                    result.conflict_count += 1
+                    existing_snap = existing_ids[snapshot.snapshot_id]
+
+                    if conflict_strategy == "skip":
+                        result.skipped_count += 1
+                        result.messages.append(
+                            f"跳过同名快照: {snapshot.snapshot_id} ({snapshot.title[:30]})"
+                        )
+                        continue
+                    elif conflict_strategy == "overwrite":
+                        overwritten_ids.append(snapshot.snapshot_id)
+                        result.messages.append(
+                            f"覆盖同名快照: {snapshot.snapshot_id}"
+                        )
+                        existing = [s for s in existing if s.snapshot_id != snapshot.snapshot_id]
+                    elif conflict_strategy == "rename":
+                        new_id = f"{snapshot.snapshot_id}_imported_{int(time.time())}"
+                        snapshot.snapshot_id = new_id
+                        result.messages.append(
+                            f"另存为新快照: {new_id}"
+                        )
+                    elif conflict_strategy == "merge":
+                        merged = self._merge_snapshots(existing_snap, snapshot)
+                        existing = [s for s in existing if s.snapshot_id != merged.snapshot_id]
+                        snapshot = merged
+                        result.merged_count += 1
+                        result.messages.append(
+                            f"合并快照: {snapshot.snapshot_id} ({snapshot.title[:30]})"
+                        )
+                    else:
+                        result.skipped_count += 1
+                        continue
+
+                self._check_snapshot_status(snapshot)
+                new_snapshots.append(snapshot)
+                result.imported_count += 1
+                result.imported_ids.append(snapshot.snapshot_id)
+
+            merged_list = existing + new_snapshots
+            merged_list = merged_list[-self._max_snapshots:]
+            self._save_all_snapshots(merged_list)
+
+            if result.imported_count > 0 or result.merged_count > 0:
+                self._save_import_undo(pre_import_backup, overwritten_ids)
+
+            result.undo_available = result.imported_count > 0 or result.merged_count > 0
+            result.success = True
+            result.messages.append(
+                f"导入完成: 成功{result.imported_count}条, "
+                f"合并{result.merged_count}条, "
+                f"跳过{result.skipped_count}条, "
+                f"冲突{result.conflict_count}条, "
+                f"错误{result.error_count}条"
+            )
+
+            self._log("import", f"导入 {result.imported_count} 条快照 (策略={conflict_strategy})",
+                      severity="info")
+
+            return result
+
+    def undo_last_import(self) -> Tuple[bool, str]:
+        with self._lock:
+            undo_data = self._load_import_undo()
+            if not undo_data:
+                self._log("undo_fail", "无可撤销的导入", severity="warning")
+                return False, "没有可撤销的最近一次导入"
+
+            backup_snapshots = undo_data.get("backup_snapshots", [])
+            overwritten_ids = undo_data.get("overwritten_ids", [])
+
+            snapshots = []
+            for d in backup_snapshots:
+                try:
+                    snapshots.append(ReviewSnapshot.from_dict(d))
+                except (KeyError, ValueError):
+                    continue
+
+            self._save_all_snapshots(snapshots)
+
+            self._clear_import_undo()
+
+            self._active_auto_snapshots.clear()
+
+            msg = f"已撤销最近一次导入，恢复到 {len(snapshots)} 个快照"
+            if overwritten_ids:
+                msg += f"（恢复了 {len(overwritten_ids)} 个被覆盖的快照）"
+
+            self._log("undo_import", msg, severity="info")
+            return True, msg
+
+    def can_undo_import(self) -> bool:
+        undo_data = self._load_import_undo()
+        return undo_data is not None
+
+    def _merge_snapshots(self, existing: ReviewSnapshot, incoming: ReviewSnapshot) -> ReviewSnapshot:
+        merged = copy.deepcopy(existing)
+
+        if incoming.updated_at > merged.updated_at:
+            merged.updated_at = incoming.updated_at
+
+        if incoming.record_snapshot and not merged.record_snapshot:
+            merged.record_snapshot = incoming.record_snapshot
+        elif incoming.record_snapshot and merged.record_snapshot:
+            if incoming.updated_at > existing.updated_at:
+                merged.record_snapshot = incoming.record_snapshot
+
+        merged_detail = merged.detail_state
+        incoming_detail = incoming.detail_state
+
+        if not merged_detail.expanded_sections and incoming_detail.expanded_sections:
+            merged_detail.expanded_sections = incoming_detail.expanded_sections
+        elif incoming_detail.expanded_sections:
+            merged_set = set(merged_detail.expanded_sections)
+            for sec in incoming_detail.expanded_sections:
+                if sec not in merged_set:
+                    merged_detail.expanded_sections.append(sec)
+
+        if not merged_detail.filter_conditions and incoming_detail.filter_conditions:
+            merged_detail.filter_conditions = incoming_detail.filter_conditions
+        elif incoming_detail.filter_conditions:
+            merged_detail.filter_conditions.update(incoming_detail.filter_conditions)
+
+        if incoming_detail.preview_file_path and not merged_detail.preview_file_path:
+            merged_detail.preview_file_path = incoming_detail.preview_file_path
+
+        if incoming_detail.timeline_position is not None and merged_detail.timeline_position is None:
+            merged_detail.timeline_position = incoming_detail.timeline_position
+
+        merged.log_entries.extend(incoming.log_entries)
+        merged.log_entries = merged.log_entries[-20:]
+
+        if incoming.batch_context and not merged.batch_context:
+            merged.batch_context = incoming.batch_context
+
+        merged.format_version = SNAPSHOT_FORMAT_VERSION
+        merged.is_auto = existing.is_auto or incoming.is_auto
+
+        merged.log_entries.append(
+            f"[{time.strftime('%H:%M:%S')}] 合并自导入快照 {incoming.snapshot_id}"
+        )
+
+        return merged
+
+    def _save_import_undo(self, backup_snapshots: List[dict], overwritten_ids: List[str]):
+        if IMPORT_UNDO_FILE is None:
+            _init_paths()
+        IMPORT_UNDO_FILE.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "backup_snapshots": backup_snapshots,
+            "overwritten_ids": overwritten_ids,
+            "timestamp": time.time(),
+        }
+        tmp = IMPORT_UNDO_FILE.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, IMPORT_UNDO_FILE)
+
+    def _load_import_undo(self) -> Optional[dict]:
+        if IMPORT_UNDO_FILE is None:
+            _init_paths()
+        if not IMPORT_UNDO_FILE.exists():
+            return None
+        try:
+            with open(IMPORT_UNDO_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+    def _clear_import_undo(self):
+        if IMPORT_UNDO_FILE is None:
+            _init_paths()
+        if IMPORT_UNDO_FILE.exists():
+            try:
+                IMPORT_UNDO_FILE.unlink()
+            except OSError:
+                pass
 
     def _check_snapshot_status(self, snapshot: ReviewSnapshot) -> None:
         health = self.check_snapshot_health(snapshot)
@@ -509,8 +927,14 @@ class ReviewWorkbenchManager:
                 data = json.load(f)
             if not isinstance(data, list):
                 return []
-            return [ReviewSnapshot.from_dict(d) for d in data]
-        except (json.JSONDecodeError, ValueError, KeyError):
+            snapshots = []
+            for d in data:
+                try:
+                    snapshots.append(ReviewSnapshot.from_dict(d))
+                except (KeyError, ValueError):
+                    continue
+            return snapshots
+        except (json.JSONDecodeError, ValueError):
             return []
 
     def _load_snapshot(self, snapshot_id: str) -> Optional[ReviewSnapshot]:
