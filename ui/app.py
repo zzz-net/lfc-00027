@@ -10,6 +10,10 @@ from core.storage import Storage
 from core.importer import TaskImporter, ImportResult
 from core.queue_manager import QueueManager
 from core.exporter import HistoryExporter, ExportResult
+from core.preflight import (
+    PreflightChecker, PreflightResult, PreflightCategory,
+    ConflictResolution, ConflictType, CATEGORY_LABELS, RESOLUTION_LABELS,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -46,6 +50,7 @@ class PrintQueueApp:
         self.storage = Storage()
         self.config = self.storage.load_config()
         self.exporter = HistoryExporter(self.storage)
+        self.preflight = PreflightChecker(self.storage)
         self.queue = QueueManager(
             self.storage, self.config,
             on_tasks_changed=self._on_tasks_changed_ui,
@@ -104,7 +109,8 @@ class PrintQueueApp:
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
         ttk.Button(bar, text="📤 导出历史", command=self._action_export_history).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="📤 导出全部", command=self._action_export_all).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="🗑 清除已完成", command=self._action_clear_history).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar, text="� 导出预检日志", command=self._action_export_preflight_logs).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar, text="� 清除已完成", command=self._action_clear_history).pack(side=tk.LEFT, padx=2)
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
         ttk.Button(bar, text="⚙ 设置", command=self._action_settings).pack(side=tk.LEFT, padx=2)
 
@@ -163,8 +169,21 @@ class PrintQueueApp:
             tree = self._build_task_tree(tab_frame, tab_name)
             self._tree_map[tab_name] = (status, tree)
 
-        right = ttk.Frame(paned, width=340)
+        right = ttk.Frame(paned, width=360)
         paned.add(right, weight=1)
+
+        ttk.Label(right, text="📋 最近预检摘要", style="Title.TLabel").pack(anchor=tk.W, padx=6, pady=(4, 2))
+        preflight_frame = ttk.Frame(right)
+        preflight_frame.pack(fill=tk.X, padx=4, pady=2)
+        self._preflight_summary_text = tk.Text(preflight_frame, wrap=tk.WORD,
+                                               font=("Microsoft YaHei UI", 9),
+                                               relief=tk.SUNKEN, bd=1, height=7)
+        self._preflight_summary_text.pack(fill=tk.X)
+        self._preflight_summary_text.configure(state=tk.DISABLED)
+        pf_btn_bar = ttk.Frame(right)
+        pf_btn_bar.pack(fill=tk.X, padx=4, pady=(0, 4))
+        ttk.Button(pf_btn_bar, text="查看详情", command=self._action_view_last_preflight,
+                   width=10).pack(side=tk.LEFT)
 
         ttk.Label(right, text="📝 操作日志", style="Title.TLabel").pack(anchor=tk.W, padx=6, pady=(4, 2))
         log_frame = ttk.Frame(right)
@@ -318,6 +337,7 @@ class PrintQueueApp:
 
     def _refresh_all(self):
         self._refresh_all_data()
+        self._refresh_preflight_summary()
         self._update_worker_status_hint()
         self._set_status(f"系统就绪 | 数据目录: {DATA_DIR}")
 
@@ -458,6 +478,36 @@ class PrintQueueApp:
         finally:
             self._detail_text.configure(state=tk.DISABLED)
 
+    def _refresh_preflight_summary(self):
+        try:
+            self._preflight_summary_text.configure(state=tk.NORMAL)
+            self._preflight_summary_text.delete("1.0", tk.END)
+            summary = self.preflight.load_last_summary()
+            if summary is None:
+                self._preflight_summary_text.insert(tk.END, "暂无预检记录\n")
+                self._preflight_summary_text.insert(tk.END, "导入任务文件后将显示预检摘要。")
+            else:
+                src = Path(summary.source_file).name
+                t = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(summary.created_at))
+                op = summary.operator or "系统"
+                self._preflight_summary_text.insert(tk.END, f"来源: {src}\n")
+                self._preflight_summary_text.insert(tk.END, f"时间: {t}\n")
+                self._preflight_summary_text.insert(tk.END, f"操作者: {op}\n")
+                self._preflight_summary_text.insert(tk.END, f"总条目: {summary.total_count}\n")
+                counts = summary.category_counts
+                self._preflight_summary_text.insert(
+                    tk.END,
+                    f"✅成功 {counts.get('success', 0)}  "
+                    f"🔧修正 {counts.get('auto_fixable', 0)}\n"
+                )
+                self._preflight_summary_text.insert(
+                    tk.END,
+                    f"⚠冲突 {counts.get('duplicate_conflict', 0)}  "
+                    f"❌失败 {counts.get('unimportable', 0)}"
+                )
+        finally:
+            self._preflight_summary_text.configure(state=tk.DISABLED)
+
     def _get_operator(self) -> str:
         self._update_operator()
         return self._operator_var.get().strip() or "系统管理员"
@@ -475,41 +525,71 @@ class PrintQueueApp:
         if not path:
             return
         try:
-            result: ImportResult = TaskImporter.import_file(
-                path, default_max_retries=self.config.max_retries_default)
+            op = self._get_operator()
+            preview = self.preflight.run_preview(
+                path, default_max_retries=self.config.max_retries_default, operator=op)
         except (FileNotFoundError, ValueError) as e:
             messagebox.showerror("导入失败", str(e))
             return
 
-        total = len(result.success) + len(result.errors) + len(result.skipped)
-        added = 0
-        if result.success:
-            added = self.queue.add_tasks(result.success)
+        self._refresh_preflight_summary()
 
-        msg_lines = [
-            f"共读取 {total} 条记录",
-            f"✅ 成功导入并添加: {added} 条",
-            f"⚠ 跳过（字段异常，已用默认值）: {len(result.skipped)} 条",
-            f"❌ 失败（严重错误，未导入）: {len(result.errors)} 条",
+        dlg = PreflightDialog(self.root, preview, self.config,
+                              preflight_checker=self.preflight)
+        self.root.wait_window(dlg)
+
+        if not dlg.confirmed:
+            self._set_status("已取消导入")
+            return
+
+        apply_result = self.preflight.apply_preview(
+            preview, self.queue, operator=op)
+
+        self._refresh_all()
+        added = apply_result["added_count"]
+        skipped = apply_result["skipped_count"]
+        failed = apply_result["failed_count"]
+        self._set_status(f"导入完成: 成功{added}条, 跳过{skipped}条, 失败{failed}条")
+        messagebox.showinfo(
+            "导入完成",
+            f"已确认导入：\n"
+            f"  ✅ 成功加入队列: {added} 条\n"
+            f"  ⏭  跳过: {skipped} 条\n"
+            f"  ❌ 失败: {failed} 条"
+        )
+
+    def _action_export_preflight_logs(self):
+        out_dir = filedialog.askdirectory(title="选择导出目录", initialdir=str(PROJECT_ROOT))
+        if not out_dir:
+            return
+        op = self._get_operator()
+        try:
+            path = self.preflight.export_apply_logs(out_dir, operator=op)
+            messagebox.showinfo("导出成功", f"预检操作日志已导出到:\n{path}")
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
+
+    def _action_view_last_preflight(self):
+        summary = self.preflight.load_last_summary()
+        if summary is None:
+            messagebox.showinfo("暂无记录", "还没有进行过预检导入。")
+            return
+        counts = summary.category_counts
+        src = Path(summary.source_file).name
+        t = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(summary.created_at))
+        lines = [
+            f"来源文件: {src}",
+            f"预检时间: {t}",
+            f"操作者: {summary.operator or '系统'}",
+            f"总条目数: {summary.total_count}",
+            "",
+            "分类统计:",
+            f"  ✅ 成功: {counts.get('success', 0)}",
+            f"  🔧 可自动修正: {counts.get('auto_fixable', 0)}",
+            f"  ⚠  重复/冲突: {counts.get('duplicate_conflict', 0)}",
+            f"  ❌ 无法导入: {counts.get('unimportable', 0)}",
         ]
-
-        if result.skipped:
-            msg_lines.append("\n--- 跳过记录详情 ---")
-            for row_num, row_id, reason in result.skipped[:20]:
-                msg_lines.append(f"  [#{row_num}] {row_id} -> {reason}")
-            if len(result.skipped) > 20:
-                msg_lines.append(f"  ... 另外 {len(result.skipped) - 20} 条已省略")
-
-        if result.errors:
-            msg_lines.append("\n--- 失败记录详情 ---")
-            for row_num, row_id, reason in result.errors[:20]:
-                msg_lines.append(f"  [#{row_num}] {row_id} -> {reason}")
-            if len(result.errors) > 20:
-                msg_lines.append(f"  ... 另外 {len(result.errors) - 20} 条已省略")
-
-        title = "导入成功" if added > 0 or not result.errors else "导入部分失败"
-        messagebox.showinfo(title, "\n".join(msg_lines))
-        self._set_status(f"导入完成: 成功{added}条, 跳过{len(result.skipped)}条, 失败{len(result.errors)}条")
+        messagebox.showinfo("最近预检摘要", "\n".join(lines))
 
     def _action_pause(self):
         ids = self._get_selected_ids()
@@ -652,6 +732,325 @@ class PrintQueueApp:
         except Exception:
             pass
         self.root.destroy()
+
+
+class PreflightDialog(tk.Toplevel):
+    def __init__(self, master, preview: PreflightResult, config: AppConfig,
+                 preflight_checker: Optional[PreflightChecker] = None):
+        super().__init__(master)
+        self.title("导入预检 - 请确认后再入队")
+        self.geometry("900x650")
+        self.minsize(800, 550)
+        self.transient(master)
+        self.grab_set()
+
+        self.preview = preview
+        self.config = config
+        self._checker = preflight_checker
+        self.confirmed = False
+        self._items_by_category: dict = {}
+        self._item_vars: dict = {}
+        self._resolution_vars: dict = {}
+        self._override_prio_vars: dict = {}
+
+        self._build()
+        self._populate_all()
+
+    def _build(self):
+        pad = {"padx": 10, "pady": 4}
+        frm = ttk.Frame(self, padding=8)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        header = ttk.Frame(frm)
+        header.pack(fill=tk.X, **pad)
+        src_name = Path(self.preview.source_file).name
+        t = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.preview.created_at))
+        ttk.Label(header, text=f"📄 来源文件: {src_name}", style="Title.TLabel").pack(anchor=tk.W)
+        ttk.Label(header, text=f"🕒 预检时间: {t}   |   操作者: {self.preview.operator or '系统'}",
+                  foreground="#6B7280").pack(anchor=tk.W, pady=(2, 0))
+
+        counts = self.preview.category_counts()
+        summary_bar = ttk.Frame(frm)
+        summary_bar.pack(fill=tk.X, **pad)
+        for cat, label in CATEGORY_LABELS.items():
+            cnt = counts.get(cat.value, 0)
+            color = {
+                PreflightCategory.SUCCESS: "#10B981",
+                PreflightCategory.AUTO_FIXABLE: "#F59E0B",
+                PreflightCategory.DUPLICATE_CONFLICT: "#EF4444",
+                PreflightCategory.UNIMPORTABLE: "#6B7280",
+            }[cat]
+            chip = tk.Frame(summary_bar, bg=color, padx=10, pady=4)
+            chip.pack(side=tk.LEFT, padx=3)
+            tk.Label(chip, text=f"{label}: {cnt}", bg=color, fg="white",
+                     font=("Microsoft YaHei UI", 9, "bold")).pack()
+
+        nb = ttk.Notebook(frm)
+        nb.pack(fill=tk.BOTH, expand=True, **pad)
+
+        self._trees: dict = {}
+        for cat, label in CATEGORY_LABELS.items():
+            tab = ttk.Frame(nb)
+            nb.add(tab, text=f"  {label} ({counts.get(cat.value, 0)})  ")
+            tree = self._build_category_tree(tab, cat)
+            self._trees[cat] = tree
+
+        btn_bar = ttk.Frame(frm)
+        btn_bar.pack(fill=tk.X, pady=(8, 4), padx=10)
+
+        ttk.Button(btn_bar, text="📤 导出预检记录", command=self._export_record).pack(side=tk.LEFT)
+        ttk.Button(btn_bar, text="全选成功类", command=lambda: self._select_all(
+            PreflightCategory.SUCCESS, True)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_bar, text="取消全部冲突", command=lambda: self._select_all(
+            PreflightCategory.DUPLICATE_CONFLICT, False)).pack(side=tk.LEFT, padx=4)
+
+        ttk.Button(btn_bar, text="取消", command=self.destroy).pack(side=tk.RIGHT, padx=4)
+        self._confirm_btn = ttk.Button(btn_bar, text="✅ 确认导入", command=self._on_confirm)
+        self._confirm_btn.pack(side=tk.RIGHT, padx=4)
+
+        self._status_var = tk.StringVar(value="请逐项确认后点击'确认导入'")
+        ttk.Label(frm, textvariable=self._status_var, foreground="#6B7280").pack(
+            anchor=tk.W, padx=12, pady=(0, 4))
+
+    def _build_category_tree(self, parent, category: PreflightCategory):
+        container = ttk.Frame(parent)
+        container.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        columns = ("selected", "row", "identifier", "detail")
+        tree = ttk.Treeview(container, columns=columns, show="headings", selectmode="browse")
+        tree.heading("selected", text="导入")
+        tree.heading("row", text="行号")
+        tree.heading("identifier", text="条目标识")
+        tree.heading("detail", text="详情")
+        tree.column("selected", width=50, anchor=tk.CENTER)
+        tree.column("row", width=60, anchor=tk.CENTER)
+        tree.column("identifier", width=280, anchor=tk.W)
+        tree.column("detail", width=400, anchor=tk.W)
+
+        tree.tag_configure("conflict", background="#FEF2F2")
+        tree.tag_configure("fixable", background="#FFFBEB")
+        tree.tag_configure("unimportable", background="#F3F4F6", foreground="#6B7280")
+        tree.tag_configure("success", background="#ECFDF5")
+
+        vsb = ttk.Scrollbar(container, orient=tk.vertical, command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        container.rowconfigure(0, weight=1)
+        container.columnconfigure(0, weight=1)
+
+        tree.bind("<Double-1>", lambda e: self._on_tree_double_click(tree, category))
+        tree.bind("<Button-1>", lambda e: self._on_tree_click(tree, category, e))
+
+        if category == PreflightCategory.DUPLICATE_CONFLICT:
+            detail_panel = ttk.Frame(parent)
+            detail_panel.pack(fill=tk.X, padx=4, pady=(0, 4))
+            ttk.Label(detail_panel, text="冲突处理策略:", font=("Microsoft YaHei UI", 9, "bold")).pack(
+                anchor=tk.W, pady=(4, 2))
+
+            strategy_bar = ttk.Frame(detail_panel)
+            strategy_bar.pack(fill=tk.X)
+            self._current_conflict_item = None
+
+            self._resolution_frame = ttk.Frame(detail_panel)
+            self._resolution_frame.pack(fill=tk.X, pady=(4, 0))
+
+            tree.bind("<<TreeviewSelect>>", lambda e: self._on_conflict_select(tree, category))
+
+        return tree
+
+    def _populate_all(self):
+        groups = self.preview.groups()
+        for cat in PreflightCategory:
+            self._populate_category(cat, groups.get(cat, []))
+
+    def _populate_category(self, category: PreflightCategory, items: list):
+        tree = self._trees[category]
+        tree.delete(*tree.get_children())
+
+        tag_map = {
+            PreflightCategory.SUCCESS: "success",
+            PreflightCategory.AUTO_FIXABLE: "fixable",
+            PreflightCategory.DUPLICATE_CONFLICT: "conflict",
+            PreflightCategory.UNIMPORTABLE: "unimportable",
+        }
+        tag = tag_map.get(category, "")
+
+        for item in items:
+            sel_char = "☑" if item.selected else "☐"
+            row = item.source_row or "-"
+            detail = ""
+            if category == PreflightCategory.AUTO_FIXABLE:
+                detail = "; ".join(item.skipped_warnings) if item.skipped_warnings else ""
+            elif category == PreflightCategory.DUPLICATE_CONFLICT:
+                detail = item.conflict_info.message if item.conflict_info else ""
+            elif category == PreflightCategory.UNIMPORTABLE:
+                detail = item.error_message
+
+            tree.insert(
+                "", tk.END, iid=str(item.item_index),
+                values=(sel_char, row, item.source_identifier, detail),
+                tags=(tag,),
+            )
+            self._item_vars[item.item_index] = item.selected
+
+    def _on_tree_click(self, tree: ttk.Treeview, category: PreflightCategory, event):
+        region = tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        col = tree.identify_column(event.x)
+        if col != "#1":
+            return
+        item_iid = tree.identify_row(event.y)
+        if not item_iid:
+            return
+        self._toggle_selected(tree, category, item_iid)
+
+    def _on_tree_double_click(self, tree: ttk.Treeview, category: PreflightCategory):
+        sel = tree.selection()
+        if not sel:
+            return
+        self._toggle_selected(tree, category, sel[0])
+
+    def _toggle_selected(self, tree: ttk.Treeview, category: PreflightCategory, item_iid: str):
+        idx = int(item_iid)
+        new_val = not self._item_vars.get(idx, True)
+        self._item_vars[idx] = new_val
+        sel_char = "☑" if new_val else "☐"
+        vals = list(tree.item(item_iid, "values"))
+        vals[0] = sel_char
+        tree.item(item_iid, values=vals)
+
+        for item in self.preview.items:
+            if item.item_index == idx:
+                item.selected = new_val
+                break
+
+        self._update_status()
+
+    def _on_conflict_select(self, tree: ttk.Treeview, category: PreflightCategory):
+        if category != PreflightCategory.DUPLICATE_CONFLICT:
+            return
+        sel = tree.selection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        self._show_conflict_controls(idx)
+
+    def _show_conflict_controls(self, item_index: int):
+        for w in self._resolution_frame.winfo_children():
+            w.destroy()
+
+        item = None
+        for it in self.preview.items:
+            if it.item_index == item_index:
+                item = it
+                break
+        if item is None or item.conflict_info is None:
+            return
+
+        self._current_conflict_item = item
+
+        info = item.conflict_info
+        ttk.Label(self._resolution_frame,
+                  text=f"冲突类型: {info.conflict_type.value}",
+                  foreground="#DC2626",
+                  font=("Microsoft YaHei UI", 9, "bold")).pack(anchor=tk.W)
+
+        if info.existing_task_filename:
+            ttk.Label(self._resolution_frame,
+                      text=f"已有任务: {info.existing_task_filename} "
+                           f"({info.existing_task_counter}, 优先级 {info.existing_task_priority})",
+                      foreground="#6B7280").pack(anchor=tk.W)
+
+        ttk.Label(self._resolution_frame, text="处理策略:",
+                  font=("Microsoft YaHei UI", 9, "bold")).pack(
+            anchor=tk.W, pady=(8, 2))
+
+        resolution_var = tk.StringVar(value=item.resolution.value)
+        self._resolution_vars[item_index] = resolution_var
+
+        strategies = [
+            (ConflictResolution.SKIP, "跳过（不导入）"),
+            (ConflictResolution.KEEP_BOTH, "保留两条（同时存在）"),
+            (ConflictResolution.OVERRIDE_PRIORITY, "覆盖优先级（新任务用新优先级）"),
+        ]
+        for val, label in strategies:
+            rb = ttk.Radiobutton(
+                self._resolution_frame, text=label, value=val.value,
+                variable=resolution_var,
+                command=lambda v=val: self._on_resolution_change(item_index, v))
+            rb.pack(anchor=tk.W)
+
+        prio_row = ttk.Frame(self._resolution_frame)
+        prio_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(prio_row, text="覆盖优先级值:").pack(side=tk.LEFT)
+        prio_var = tk.IntVar(value=item.override_priority_value or 1)
+        self._override_prio_vars[item_index] = prio_var
+        sp = ttk.Spinbox(prio_row, from_=1, to=999, textvariable=prio_var, width=8,
+                         command=lambda: self._on_priority_change(item_index))
+        sp.pack(side=tk.LEFT, padx=4)
+        ttk.Label(prio_row, text="（数值越小越优先）", foreground="#6B7280").pack(side=tk.LEFT)
+
+    def _on_resolution_change(self, item_index: int, resolution: ConflictResolution):
+        for item in self.preview.items:
+            if item.item_index == item_index:
+                item.resolution = resolution
+                prio_var = self._override_prio_vars.get(item_index)
+                if prio_var is not None and resolution == ConflictResolution.OVERRIDE_PRIORITY:
+                    item.override_priority_value = prio_var.get()
+                break
+        self._update_status()
+
+    def _on_priority_change(self, item_index: int):
+        prio_var = self._override_prio_vars.get(item_index)
+        if prio_var is None:
+            return
+        for item in self.preview.items:
+            if item.item_index == item_index:
+                item.override_priority_value = prio_var.get()
+                break
+
+    def _select_all(self, category: PreflightCategory, selected: bool):
+        tree = self._trees[category]
+        for item_iid in tree.get_children():
+            idx = int(item_iid)
+            self._item_vars[idx] = selected
+            sel_char = "☑" if selected else "☐"
+            vals = list(tree.item(item_iid, "values"))
+            vals[0] = sel_char
+            tree.item(item_iid, values=vals)
+
+        for item in self.preview.items:
+            if item.category == category:
+                item.selected = selected
+
+        self._update_status()
+
+    def _update_status(self):
+        selected_count = sum(1 for it in self.preview.items if it.selected)
+        total = len(self.preview.items)
+        self._status_var.set(f"已选择 {selected_count}/{total} 条待导入")
+
+    def _export_record(self):
+        if self._checker is None:
+            messagebox.showwarning("无法导出", "预检检查器未初始化，无法导出。")
+            return
+        out_dir = filedialog.askdirectory(title="选择导出目录", parent=self,
+                                          initialdir=str(PROJECT_ROOT))
+        if not out_dir:
+            return
+        try:
+            op = self.preview.operator or "系统"
+            path = self._checker.export_preview_record(
+                self.preview, out_dir, operator=op)
+            messagebox.showinfo("导出成功", f"预检记录已导出到:\n{path}")
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
+
+    def _on_confirm(self):
+        self.confirmed = True
+        self.destroy()
 
 
 class SettingsDialog(tk.Toplevel):
